@@ -16,13 +16,36 @@ the backend is new.
 
 Phase 1 is complete: a session can be listed, created (with or without a
 workspace), renamed, prompted, cancelled, paged, followed live and projected,
-and the chat page renders both sides of the conversation.
-Streaming tokens are not implemented; an assistant message arrives as one
-final event.
+and the chat page renders both sides of the conversation. Reasoning and answer
+tokens stream live and survive reconnects.
 
-Deliberately out of scope for now: tools and permissions, subagents, jobs,
-terminal, attachments and images, queue steering, search, federation, and the
-Node host's zstd compression and cross-process log locking.
+The core model tools are implemented with DSH-compatible results:
+`bash`, `read`, `write`, `edit`, `glob` and `grep`. Oversized search results
+are spilled under the session directory so the model can page through them.
+
+Deliberately out of scope for now: subagents, jobs, terminal, attachments and
+images, queue steering, search, federation, additional tools, and the Node
+host's zstd compression and cross-process log locking.
+
+## Tools and permissions
+
+Tool calls resolve relative paths against the session workspace. Each session
+gets the permission and sandbox modes recorded in its header:
+
+- `danger-full-access` (the default) allows reads and writes anywhere the
+  process can reach.
+- `workspace-write` allows reads anywhere, but confines `write` and `edit`
+  mutations to the session workspace. Symlinks are resolved before the check.
+- `read-only` rejects file mutations.
+
+`write` and `edit` require the file to have been observed first, either by
+`read` or by an earlier successful write/edit in the same session. The
+observation memory is in-process and resets when the server restarts.
+
+Approval prompts are not implemented; the approval policy is accepted and
+recorded, and mutations run without an interactive approval step. Shell
+commands run with the harness process's privileges: the file policy does not
+confine what a `bash` command itself writes with its own tools.
 
 ## Requirements
 
@@ -171,10 +194,11 @@ Flags (also see `dsh-go serve -h`):
 | `--provider` / `--model` / `--reasoning` | `deepseek` / `deepseek-chat` / unset | model selection |
 | `--protocol` | `openai-chat` | wire format: `openai-chat` or `anthropic-messages` |
 | `--base-url` | `https://api.deepseek.com/v1` | model endpoint base URL |
+| `--tool-root` | process cwd | fallback workspace and startup validation root for tools |
 
 Environment: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DSH_GO_SESSIONS_ROOT`,
 `DSH_GO_TOKEN`, `DSH_GO_PROVIDER`, `DSH_GO_MODEL`, `DSH_GO_REASONING_EFFORT`,
-`DSH_GO_PROTOCOL`, `DSH_GO_ASSETS_DIR`.
+`DSH_GO_PROTOCOL`, `DSH_GO_ASSETS_DIR`, `DSH_GO_TOOL_ROOT`.
 
 By default the server binds loopback and has no authentication. `--token`
 mints a signed cookie from `GET /?token=…`; WebSocket clients may also pass

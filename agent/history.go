@@ -97,9 +97,11 @@ func (r *Runner) systemPrompt() string {
 		return prompt
 	}
 	return prompt + "\n\n" +
-		"You can call the read-only tools read, glob, and grep. " +
-		"Every path is resolved inside the configured workspace root; paths outside it are rejected. " +
-		"Use tools when you need to inspect files, then answer from what you observed."
+		"You can call the tools bash, read, write, edit, glob, and grep. " +
+		"Relative paths resolve against the session working directory. " +
+		"Reads may target any accessible path; under workspace-write, file modifications must stay inside the session workspace. " +
+		"Shell commands run with the harness process's privileges and are not confined by the filesystem policy. " +
+		"Use tools when you need to inspect or change files, then answer from what you observed."
 }
 
 func assistantText(blocks []transcriptBlock) string {

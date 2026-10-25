@@ -205,10 +205,16 @@ func (r *Runner) runTool(ctx context.Context, sess *session.Session, turn, step 
 	output := "cancelled"
 	isError := true
 	if ctx.Err() == nil {
-		output, isError = r.tools.Execute(ctx, call.block.Name, call.block.Arguments)
+		output, isError = r.tools.Execute(ctx, ToolInvocation{
+			SessionID:  sess.ID(),
+			SessionDir: sess.Dir(),
+			Cwd:        sess.Cwd(),
+			Name:       call.block.Name,
+			Arguments:  call.block.Arguments,
+		})
 	}
 	if len(output) > toolOutputLimit {
-		output = output[:toolOutputLimit]
+		output = truncateUTF8(output, toolOutputLimit)
 	}
 	data := map[string]any{
 		"turn": turn,

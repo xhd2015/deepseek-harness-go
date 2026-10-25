@@ -1,63 +1,92 @@
 package agent
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
+	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
-	"regexp"
-	"sort"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/xhd2015/deepseek-harness-go/llm"
 )
 
 const (
 	toolOutputLimit = 256 * 1024
-	globResultLimit = 100
-	grepMatchLimit  = 250
-	readLineLimit   = 2000
+
+	readLineLimit      = 2000
+	readMaxLineLength  = 2000
+	readMaxBytes       = 50 * 1024
+	globResultLimit    = 100
+	grepMatchLimit     = 250
+	grepMaxLineBytes   = 2000
+	bashMaxOutputBytes = 64 * 1000
+	bashDefaultTimeout = 120 * time.Second
+	bashMaxTimeout     = 600 * time.Second
 )
 
-// ToolExecutor serves the read-only tools this host exposes. A zero root
-// disables every tool.
-type ToolExecutor struct {
-	root     string
-	enabled  bool
-	initErr  error
-	patterns map[string]*regexp.Regexp
+// ToolInvocation is one tool call in its session context. Cwd is the session
+// workspace; SessionDir is where oversized search results are spilled.
+type ToolInvocation struct {
+	SessionID  string
+	SessionDir string
+	Cwd        string
+	Name       string
+	Arguments  string
 }
 
-// NewToolExecutor canonicalizes root and reports whether tools are available.
+// ToolExecutor hosts the core tools this backend exposes. Every call resolves
+// relative paths against its invocation's workspace, so one executor serves
+// all sessions.
+type ToolExecutor struct {
+	root       string
+	permission string
+	sandbox    string
+	enabled    bool
+	initErr    error
+	observed   observationStore
+}
+
+type observationStore struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func (o *observationStore) mark(sessionID, path string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.seen == nil {
+		o.seen = map[string]bool{}
+	}
+	o.seen[sessionID+"\x00"+path] = true
+}
+
+func (o *observationStore) has(sessionID, path string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.seen[sessionID+"\x00"+path]
+}
+
+// NewToolExecutor canonicalizes the configured workspace. An empty root uses
+// the process working directory, matching the DSH default workspace.
 func NewToolExecutor(root string) *ToolExecutor {
-	executor := &ToolExecutor{patterns: map[string]*regexp.Regexp{}}
+	executor := &ToolExecutor{permission: "danger-full-access", sandbox: "danger-full-access"}
 	if strings.TrimSpace(root) == "" {
-		return executor
+		cwd, err := os.Getwd()
+		if err != nil {
+			executor.initErr = err
+			return executor
+		}
+		root = cwd
 	}
-	absolute, err := filepath.Abs(root)
+	resolved, err := canonicalDir(root)
 	if err != nil {
 		executor.initErr = err
-		return executor
-	}
-	resolved, err := filepath.EvalSymlinks(absolute)
-	if err != nil {
-		executor.initErr = err
-		return executor
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		executor.initErr = err
-		return executor
-	}
-	if !info.IsDir() {
-		executor.initErr = fmt.Errorf("%s is not a directory", resolved)
 		return executor
 	}
 	executor.root = resolved
@@ -65,7 +94,20 @@ func NewToolExecutor(root string) *ToolExecutor {
 	return executor
 }
 
-// Enabled reports whether a usable root was configured.
+// SetPolicy records the permission/sandbox modes used for mutation checks.
+func (e *ToolExecutor) SetPolicy(permission, sandbox string) {
+	if e == nil {
+		return
+	}
+	if permission != "" {
+		e.permission = permission
+	}
+	if sandbox != "" {
+		e.sandbox = sandbox
+	}
+}
+
+// Enabled reports whether the executor has a usable workspace root.
 func (e *ToolExecutor) Enabled() bool { return e != nil && e.enabled }
 
 // InitError reports why a configured root was rejected.
@@ -83,12 +125,42 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 	}
 	return []llm.ToolDef{
 		{
+			Name: "bash",
+			Description: "Execute a bash command (`bash -c`) and return its stdout/stderr. " +
+				"Each call runs in a fresh shell; pass `workdir` instead of using `cd`. " +
+				"Provide `description` before `command` in the arguments. " +
+				"Before any delete or move, verify that the resolved absolute target path is the intended one; never run it against a computed path you have not checked. " +
+				"An unset variable expands to an empty string, so guard variables in such paths with `${VAR:?}`.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"description": map[string]any{
+						"type":        "string",
+						"description": "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples: \"ls\" → \"List files in current directory\"; \"git status\" → \"Show working tree status\"; \"npm install\" → \"Install package dependencies\".",
+					},
+					"command": map[string]any{
+						"type":        "string",
+						"description": "The bash command to execute.",
+					},
+					"timeoutMs": map[string]any{
+						"type":        "number",
+						"description": "Timeout in milliseconds. The executor applies its configured default and cap, and kills the command on expiry.",
+					},
+					"workdir": map[string]any{
+						"type":        "string",
+						"description": "Working directory for this command. Defaults to the session workspace; a relative path is resolved against it.",
+					},
+				},
+				"required": []string{"description", "command"},
+			},
+		},
+		{
 			Name:        "read",
 			Description: "Read a UTF-8 text file and return line-numbered content.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"file_path": map[string]any{"type": "string", "description": "Path to read, resolved against the tool root."},
+					"file_path": map[string]any{"type": "string", "description": "Path to read, resolved by the filesystem backend."},
 					"offset":    map[string]any{"type": "number", "description": "1-based first line to return. Defaults to 1."},
 					"limit":     map[string]any{"type": "number", "description": "Maximum number of lines to return. Defaults to 2000."},
 				},
@@ -96,26 +168,52 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 			},
 		},
 		{
-			Name:        "glob",
-			Description: "Find files, not directories, whose paths match a glob pattern. Returns up to 100 paths in modification-time order.",
+			Name:        "write",
+			Description: "Create or fully replace a UTF-8 text file.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"pattern": map[string]any{"type": "string", "description": "Glob pattern such as **/*.go or *.md. A pattern without / matches the basename at any depth."},
-					"path":    map[string]any{"type": "string", "description": "Directory to search in. Defaults to the tool root."},
+					"file_path": map[string]any{"type": "string", "description": "Path to write, resolved by the filesystem backend. Provide `file_path` before `content` in the arguments."},
+					"content":   map[string]any{"type": "string", "description": "Full UTF-8 text content to write."},
+				},
+				"required": []string{"file_path", "content"},
+			},
+		},
+		{
+			Name:        "edit",
+			Description: "Edit an existing UTF-8 text file by replacing literal text.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"file_path":   map[string]any{"type": "string", "description": "Path to edit, resolved by the filesystem backend. Provide `file_path` before `old_string` and `new_string` in the arguments."},
+					"old_string":  map[string]any{"type": "string", "description": "Literal text to replace."},
+					"new_string":  map[string]any{"type": "string", "description": "Literal replacement text. Use an empty string to delete the match."},
+					"replace_all": map[string]any{"type": "boolean", "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once."},
+				},
+				"required": []string{"file_path", "old_string", "new_string"},
+			},
+		},
+		{
+			Name:        "glob",
+			Description: "Find files, not directories, whose paths match a glob pattern, including hidden and ignored files. Returns up to 100 paths in modification-time order; a larger result is sampled across top-level entries and reports where the complete list was saved.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"pattern": map[string]any{"type": "string", "description": "Glob pattern to match file paths against (e.g. \"**/*.ts\", \"src/**/*.test.js\"). A pattern with no \"/\" matches the basename at any depth, so \"*\" and \"*.ts\" both search the whole tree; include a separator to anchor the depth."},
+					"path":    map[string]any{"type": "string", "description": "Directory to search in. Defaults to the session workspace; a relative path resolves against it."},
 				},
 				"required": []string{"pattern"},
 			},
 		},
 		{
 			Name:        "grep",
-			Description: "Search file contents with a regular expression. Returns matching lines with line numbers, grouped by file.",
+			Description: "Search file contents with a ripgrep regular expression. Returns matching lines with line numbers, grouped by file. Returns up to 250 matches; a larger result reports where the complete match list was saved.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"pattern": map[string]any{"type": "string", "description": "Regular expression to search for."},
-					"path":    map[string]any{"type": "string", "description": "File or directory to search. Defaults to the tool root."},
-					"include": map[string]any{"type": "string", "description": "One glob filter for which files to search, such as *.go."},
+					"pattern": map[string]any{"type": "string", "description": "Regular expression to search for (ripgrep syntax)."},
+					"path":    map[string]any{"type": "string", "description": "File or directory to search. Defaults to the session workspace; a relative path resolves against it."},
+					"include": map[string]any{"type": "string", "description": "One glob filter for which files to search (e.g. \"*.ts\", \"*.{js,jsx}\"). Not a list; negation is not supported."},
 				},
 				"required": []string{"pattern"},
 			},
@@ -125,386 +223,202 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 
 // Execute runs one tool call and returns model-facing text plus whether the
 // invocation failed.
-func (e *ToolExecutor) Execute(ctx context.Context, name, arguments string) (string, bool) {
+func (e *ToolExecutor) Execute(ctx context.Context, inv ToolInvocation) (string, bool) {
 	if !e.Enabled() {
 		return "tools are not enabled", true
 	}
 	var args map[string]any
-	if strings.TrimSpace(arguments) != "" {
-		if err := json.Unmarshal([]byte(arguments), &args); err != nil {
+	if strings.TrimSpace(inv.Arguments) != "" {
+		if err := json.Unmarshal([]byte(inv.Arguments), &args); err != nil {
 			return "invalid tool arguments: " + err.Error(), true
 		}
 	}
-	switch name {
+	if args == nil {
+		args = map[string]any{}
+	}
+	switch inv.Name {
+	case "bash":
+		return e.bash(ctx, inv, args)
 	case "read":
-		return e.read(ctx, args)
+		return e.read(ctx, inv, args)
+	case "write":
+		return e.write(ctx, inv, args)
+	case "edit":
+		return e.edit(ctx, inv, args)
 	case "glob":
-		return e.glob(ctx, args)
+		return e.glob(ctx, inv, args)
 	case "grep":
-		return e.grep(ctx, args)
+		return e.grep(ctx, inv, args)
 	default:
-		return "unknown tool: " + name, true
+		return "unknown tool: " + inv.Name, true
 	}
 }
 
-func (e *ToolExecutor) read(ctx context.Context, args map[string]any) (string, bool) {
-	filePath, ok := stringArg(args, "file_path")
-	if !ok || strings.TrimSpace(filePath) == "" {
-		return "file_path must be a non-empty string", true
+// baseDir resolves the workspace all relative paths in this call use.
+func (e *ToolExecutor) baseDir(inv ToolInvocation) (string, error) {
+	raw := strings.TrimSpace(inv.Cwd)
+	if raw == "" {
+		raw = e.root
 	}
-	offset := intArg(args, "offset", 1)
-	limit := intArg(args, "limit", readLineLimit)
-	if offset < 1 {
-		offset = 1
+	if raw == "" {
+		return "", fmt.Errorf("session workspace is not available")
 	}
-	if limit < 1 {
-		limit = readLineLimit
-	}
-	if limit > readLineLimit {
-		return fmt.Sprintf("limit must be less than or equal to %d", readLineLimit), true
-	}
-	resolved, err := e.resolve(filePath, false)
+	resolved, err := canonicalDir(raw)
 	if err != nil {
-		return err.Error(), true
-	}
-	file, err := os.Open(resolved)
-	if err != nil {
-		return err.Error(), true
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return err.Error(), true
-	}
-	if info.IsDir() {
-		return "path is a directory: " + resolved, true
-	}
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	line := 0
-	total := 0
-	var body strings.Builder
-	last := offset - 1
-	for scanner.Scan() {
-		line++
-		total = line
-		if line < offset {
-			continue
-		}
-		if line >= offset+limit {
-			continue
-		}
-		if err := ctx.Err(); err != nil {
-			return err.Error(), true
-		}
-		text := scanner.Text()
-		fmt.Fprintf(&body, "%d: %s\n", line, text)
-		last = line
-		if body.Len() > toolOutputLimit {
-			break
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err.Error(), true
-	}
-	display := resolved
-	if rel, err := filepath.Rel(e.root, resolved); err == nil && !strings.HasPrefix(rel, "..") {
-		display = filepath.ToSlash(rel)
-	}
-	footer := fmt.Sprintf("(End of file - total %d lines)", total)
-	if last < total {
-		footer = fmt.Sprintf("(Showing lines %d-%d of %d. Use offset=%d to continue.)", offset, last, total, last+1)
-	}
-	content := strings.TrimSuffix(body.String(), "\n")
-	if content == "" {
-		content = footer
-	} else {
-		content += "\n\n" + footer
-	}
-	return fmt.Sprintf("<path>%s</path>\n<type>file</type>\n<content>\n%s\n</content>", display, content), false
-}
-
-func (e *ToolExecutor) glob(ctx context.Context, args map[string]any) (string, bool) {
-	pattern, ok := stringArg(args, "pattern")
-	if !ok || strings.TrimSpace(pattern) == "" {
-		return "pattern must be a non-empty string", true
-	}
-	pattern = filepath.ToSlash(pattern)
-	if strings.HasPrefix(pattern, "/") || strings.Contains(pattern, "..") {
-		return "pattern must stay inside the tool root", true
-	}
-	base := e.root
-	if dir, ok := stringArg(args, "path"); ok && strings.TrimSpace(dir) != "" {
-		resolved, err := e.resolve(dir, true)
-		if err != nil {
-			return err.Error(), true
-		}
-		base = resolved
-	}
-	info, err := os.Stat(base)
-	if err != nil {
-		return err.Error(), true
-	}
-	if !info.IsDir() {
-		return "path is not a directory: " + base, true
-	}
-	basenameOnly := !strings.Contains(pattern, "/")
-	type found struct {
-		path    string
-		modTime time.Time
-	}
-	files := make([]found, 0, 64)
-	visited := 0
-	deadline := time.Now().Add(10 * time.Second)
-	errStop := fmt.Errorf("stop")
-	err = filepath.WalkDir(base, func(candidate string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			if entry != nil && entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if time.Now().After(deadline) {
-			return errStop
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		visited++
-		if visited > 100000 {
-			return errStop
-		}
-		rel, err := filepath.Rel(e.root, candidate)
-		if err != nil || strings.HasPrefix(rel, "..") {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		target := rel
-		if basenameOnly {
-			target = path.Base(rel)
-		}
-		if !globMatch(pattern, target) {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return nil
-		}
-		files = append(files, found{path: rel, modTime: info.ModTime()})
-		return nil
-	})
-	if err != nil && err != errStop && ctx.Err() == nil {
-		return err.Error(), true
-	}
-	sort.SliceStable(files, func(i, j int) bool {
-		if files[i].modTime.Equal(files[j].modTime) {
-			return files[i].path < files[j].path
-		}
-		return files[i].modTime.After(files[j].modTime)
-	})
-	if len(files) == 0 {
-		return "No files found", false
-	}
-	truncated := len(files) > globResultLimit
-	if truncated {
-		files = files[:globResultLimit]
-	}
-	lines := make([]string, len(files))
-	for i, file := range files {
-		lines[i] = file.path
-	}
-	output := strings.Join(lines, "\n")
-	if truncated {
-		output = fmt.Sprintf("%s\n\n(Showing first %d files. Narrow the pattern to see more.)", output, globResultLimit)
-	}
-	return trimOutput(output), false
-}
-
-func (e *ToolExecutor) grep(ctx context.Context, args map[string]any) (string, bool) {
-	pattern, ok := stringArg(args, "pattern")
-	if !ok || pattern == "" {
-		return "pattern must be a non-empty string", true
-	}
-	compiled, err := regexp.Compile(pattern)
-	if err != nil {
-		return "invalid regular expression: " + err.Error(), true
-	}
-	base := e.root
-	if target, ok := stringArg(args, "path"); ok && strings.TrimSpace(target) != "" {
-		resolved, err := e.resolve(target, true)
-		if err != nil {
-			return err.Error(), true
-		}
-		base = resolved
-	}
-	include, _ := stringArg(args, "include")
-	type match struct {
-		path string
-		line int
-		text string
-	}
-	matches := []match{}
-	addFile := func(filePath string) error {
-		if len(matches) >= grepMatchLimit {
-			return fmt.Errorf("stop")
-		}
-		info, err := os.Stat(filePath)
-		if err != nil || info.IsDir() || info.Size() > 8*1024*1024 {
-			return nil
-		}
-		if include != "" {
-			rel, _ := filepath.Rel(e.root, filePath)
-			if !globMatch(include, filepath.ToSlash(rel)) && !globMatch(include, filepath.Base(filePath)) {
-				return nil
-			}
-		}
-		file, err := os.Open(filePath)
-		if err != nil {
-			return nil
-		}
-		defer file.Close()
-		head := make([]byte, 8192)
-		n, _ := file.Read(head)
-		if bytes.IndexByte(head[:n], 0) >= 0 {
-			return nil
-		}
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			return nil
-		}
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		line := 0
-		rel, _ := filepath.Rel(e.root, filePath)
-		for scanner.Scan() {
-			line++
-			if compiled.MatchString(scanner.Text()) {
-				text := scanner.Text()
-				if len(text) > 400 {
-					text = text[:400] + "…"
-				}
-				matches = append(matches, match{path: filepath.ToSlash(rel), line: line, text: text})
-				if len(matches) >= grepMatchLimit {
-					return fmt.Errorf("stop")
-				}
-			}
-		}
-		return nil
-	}
-	info, err := os.Stat(base)
-	if err != nil {
-		return err.Error(), true
-	}
-	if info.IsDir() {
-		_ = filepath.WalkDir(base, func(candidate string, entry os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return nil
-			}
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if entry.IsDir() {
-				return nil
-			}
-			return addFile(candidate)
-		})
-	} else {
-		_ = addFile(base)
-	}
-	if err := ctx.Err(); err != nil {
-		return err.Error(), true
-	}
-	if len(matches) == 0 {
-		return "No matches found", false
-	}
-	byFile := map[string][]match{}
-	order := []string{}
-	for _, item := range matches {
-		if _, seen := byFile[item.path]; !seen {
-			order = append(order, item.path)
-		}
-		byFile[item.path] = append(byFile[item.path], item)
-	}
-	var output strings.Builder
-	for i, filePath := range order {
-		if i > 0 {
-			output.WriteString("\n\n")
-		}
-		output.WriteString(filePath)
-		for _, item := range byFile[filePath] {
-			fmt.Fprintf(&output, "\nLine %d: %s", item.line, item.text)
-		}
-	}
-	text := trimOutput(output.String())
-	if len(matches) >= grepMatchLimit {
-		text += fmt.Sprintf("\n\n(Showing first %d matches. Narrow the pattern to see more.)", grepMatchLimit)
-	}
-	return text, false
-}
-
-func (e *ToolExecutor) resolve(raw string, allowDir bool) (string, error) {
-	candidate := raw
-	if !filepath.IsAbs(candidate) {
-		candidate = filepath.Join(e.root, candidate)
-	}
-	candidate = filepath.Clean(candidate)
-	resolved, err := filepath.EvalSymlinks(candidate)
-	if err != nil {
-		parent, parentErr := filepath.EvalSymlinks(filepath.Dir(candidate))
-		if parentErr != nil {
-			return "", fmt.Errorf("path is outside the tool root")
-		}
-		if !withinRoot(e.root, parent) {
-			return "", fmt.Errorf("path is outside the tool root")
-		}
-		resolved = filepath.Join(parent, filepath.Base(candidate))
-	}
-	if !withinRoot(e.root, resolved) {
-		return "", fmt.Errorf("path is outside the tool root")
-	}
-	if !allowDir {
-		info, err := os.Stat(resolved)
-		if err == nil && info.IsDir() {
-			return "", fmt.Errorf("path is a directory: %s", resolved)
-		}
+		return "", fmt.Errorf("session workspace is not available: %v", err)
 	}
 	return resolved, nil
 }
 
-func withinRoot(root, candidate string) bool {
-	rel, err := filepath.Rel(root, candidate)
+func canonicalDir(raw string) (string, error) {
+	absolute, err := filepath.Abs(raw)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", resolved)
+	}
+	return resolved, nil
+}
+
+// resolvePath turns a model-supplied path into a canonical absolute path and
+// the lexical display path used in model-facing error messages. DSH reports
+// the path as the caller spelled it (made absolute), not as the symlink target.
+func (e *ToolExecutor) resolvePath(inv ToolInvocation, raw string, allowMissing bool) (string, string, error) {
+	base, err := e.baseDir(inv)
+	if err != nil {
+		return "", filepath.ToSlash(raw), err
+	}
+	display := lexicalDisplayPath(base, raw)
+	candidate := display
+	resolved, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		if !allowMissing || !os.IsNotExist(err) {
+			return "", display, err
+		}
+		resolved, err = resolveMissingPath(candidate)
+		if err != nil {
+			return "", display, err
+		}
+	}
+	return resolved, display, nil
+}
+
+// lexicalDisplayPath anchors a caller path without resolving symlinks, matching
+// DSH's target.displayPath spelling.
+func lexicalDisplayPath(base, raw string) string {
+	candidate := raw
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(base, candidate)
+	}
+	return filepath.ToSlash(filepath.Clean(candidate))
+}
+
+// pathErrorText reduces an OS path error to the stable wording DSH exposes.
+func pathErrorText(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "not found"
+	case errors.Is(err, fs.ErrPermission):
+		return "permission denied"
+	default:
+		return err.Error()
+	}
+}
+
+// resolveMissingPath canonicalizes the existing ancestor of a path whose tail
+// may not exist yet, so write can create missing parent directories without
+// resolving symlinks in reverse.
+func resolveMissingPath(candidate string) (string, error) {
+	var tail []string
+	current := candidate
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("cannot resolve parent of %s", candidate)
+		}
+		tail = append(tail, filepath.Base(current))
+		resolved, err := filepath.EvalSymlinks(parent)
+		if err == nil {
+			for index := len(tail) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, tail[index])
+			}
+			return resolved, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		current = parent
+	}
+}
+
+func displayPath(absolute, base string) string {
+	rel, err := filepath.Rel(base, absolute)
+	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return filepath.ToSlash(rel)
+	}
+	return filepath.ToSlash(absolute)
+}
+
+func withinBase(base, candidate string) bool {
+	rel, err := filepath.Rel(base, candidate)
 	if err != nil {
 		return false
 	}
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-func globMatch(pattern, target string) bool {
-	pattern = filepath.ToSlash(pattern)
-	target = filepath.ToSlash(target)
-	return matchSegments(strings.Split(pattern, "/"), strings.Split(target, "/"))
+// allowMutation applies the configured file policy. Shell commands are not
+// confined by this check; only the filesystem tools are.
+func (e *ToolExecutor) allowMutation(inv ToolInvocation, target, display string) error {
+	if e.permission == "read-only" || e.sandbox == "read-only" {
+		return fmt.Errorf("cannot modify %q: tools are read-only", display)
+	}
+	if e.sandbox == "workspace-write" {
+		base, err := e.baseDir(inv)
+		if err != nil {
+			return err
+		}
+		if !withinBase(base, target) {
+			return fmt.Errorf("cannot modify %q: path is outside the session workspace", display)
+		}
+	}
+	return nil
 }
 
-func matchSegments(pattern, target []string) bool {
-	if len(pattern) == 0 {
-		return len(target) == 0
+func (e *ToolExecutor) requireObserved(inv ToolInvocation, target, display string) error {
+	if e.observed.has(inv.SessionID, target) {
+		return nil
 	}
-	if pattern[0] == "**" {
-		if matchSegments(pattern[1:], target) {
-			return true
-		}
-		return len(target) > 0 && matchSegments(pattern, target[1:])
+	return fmt.Errorf("cannot modify %q: file has not been read — read the file, then retry", display)
+}
+
+func (e *ToolExecutor) markObserved(inv ToolInvocation, target string) {
+	e.observed.mark(inv.SessionID, target)
+}
+
+func (e *ToolExecutor) spill(inv ToolInvocation, name, content string) (string, bool) {
+	dir := strings.TrimSpace(inv.SessionDir)
+	if dir == "" {
+		return "", false
 	}
-	if len(target) == 0 {
-		return false
+	spillDir := filepath.Join(dir, "spill")
+	if err := os.MkdirAll(spillDir, 0o755); err != nil {
+		return "", false
 	}
-	matched, err := path.Match(pattern[0], target[0])
-	if err != nil || !matched {
-		return false
+	target := filepath.Join(spillDir, fmt.Sprintf("%d-%s", time.Now().UnixNano(), name))
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		return "", false
 	}
-	return matchSegments(pattern[1:], target[1:])
+	return target, true
 }
 
 func stringArg(args map[string]any, name string) (string, bool) {
@@ -516,30 +430,52 @@ func stringArg(args map[string]any, name string) (string, bool) {
 	return text, ok
 }
 
-func intArg(args map[string]any, name string, fallback int) int {
+func boolArg(args map[string]any, name string) bool {
 	value, ok := args[name]
 	if !ok {
-		return fallback
+		return false
+	}
+	flag, _ := value.(bool)
+	return flag
+}
+
+func numberArg(args map[string]any, name string) (float64, bool) {
+	value, ok := args[name]
+	if !ok {
+		return 0, false
 	}
 	switch typed := value.(type) {
 	case float64:
-		return int(typed)
+		return typed, true
 	case json.Number:
-		parsed, err := strconv.Atoi(typed.String())
-		if err == nil {
-			return parsed
-		}
+		parsed, err := typed.Float64()
+		return parsed, err == nil
+	default:
+		return 0, false
 	}
-	return fallback
 }
 
-func trimOutput(text string) string {
-	if len(text) <= toolOutputLimit {
+func positiveIntArg(args map[string]any, name string, fallback int) (int, error) {
+	value, ok := numberArg(args, name)
+	if !ok {
+		if _, present := args[name]; present {
+			return 0, fmt.Errorf("%s must be a positive integer", name)
+		}
+		return fallback, nil
+	}
+	if value < 1 || value != float64(int(value)) {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return int(value), nil
+}
+
+func truncateUTF8(text string, limit int) string {
+	if len(text) <= limit {
 		return text
 	}
-	cut := text[:toolOutputLimit]
-	if index := strings.LastIndex(cut, "\n"); index > 0 {
-		cut = cut[:index]
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
 	}
-	return cut + "\n\n(Output capped.)"
+	return text[:cut]
 }

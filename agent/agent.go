@@ -64,8 +64,9 @@ type Config struct {
 	// HistoryLimit caps how many transcript messages are sent back; zero keeps
 	// the whole transcript.
 	HistoryLimit int
-	// ToolRoot is the only directory the read-only tools may touch. Empty
-	// disables tool use entirely.
+	// ToolRoot is the fallback workspace for tool calls whose session has no
+	// recorded cwd, and the directory validated at startup. It does not limit
+	// reads. Empty uses the process working directory.
 	ToolRoot string
 	// MaxSteps caps model steps per turn. Zero uses the default of 8.
 	MaxSteps int
@@ -111,6 +112,7 @@ func New(cfg Config) *Runner {
 		cfg.MaxSteps = 8
 	}
 	tools := NewToolExecutor(cfg.ToolRoot)
+	tools.SetPolicy(cfg.PermissionPreset, cfg.SandboxMode)
 	if cfg.ToolRoot != "" && tools.InitError() != nil && cfg.Logf != nil {
 		cfg.Logf("tools disabled: %v", tools.InitError())
 	}

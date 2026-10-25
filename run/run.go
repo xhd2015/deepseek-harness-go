@@ -69,8 +69,9 @@ type Options struct {
 	APIKey     string
 	DefaultCwd string
 	Home       string
-	// ToolRoot enables the read-only filesystem tools and confines them to
-	// this directory. Empty keeps tools disabled.
+	// ToolRoot is the fallback workspace for tool calls whose session has no
+	// recorded cwd, and the directory validated at startup. It is not a read
+	// jail. Empty uses the process working directory.
 	ToolRoot string
 
 	Stdout io.Writer
@@ -260,8 +261,8 @@ Options:
                            (default ~/.dsh/profiles/web/cordis.patch.yml)
       --base-url URL       model endpoint base URL
                            (default https://api.deepseek.com/v1)
-      --tool-root DIR      enable read/glob/grep confined to DIR
-                           (default: tools disabled)
+      --tool-root DIR      fallback workspace when a session has no cwd
+                           (default: process working directory)
   -v, --version            print the version
   -h, --help               show this help
 
@@ -275,7 +276,7 @@ Environment:
   DSH_GO_REASONING_EFFORT  reasoning effort
   DSH_GO_PROTOCOL         model wire protocol (openai-chat or anthropic-messages)
   DSH_GO_MODELS           cordis patch that defines every model route
-  DSH_GO_TOOL_ROOT        enable read-only tools confined to this directory
+  DSH_GO_TOOL_ROOT        fallback tool workspace (default: process cwd)
   DSH_GO_ASSETS_DIR        captured frontend directory
 
 Commands:

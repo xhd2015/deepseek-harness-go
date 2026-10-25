@@ -1,0 +1,15 @@
+# Built binary.
+/dist/
+
+# Captured frontend: 23 MiB of Next.js/React plugin bundles, reproducible from
+# a running DeepSeek Harness web server with `go run ./script/sync-assets`.
+# The directory itself must exist for //go:embed only when assets are captured;
+# .gitkeep makes the package build without a capture.
+/assets/dist/*
+!/assets/dist/.gitkeep
+
+# Scratch space for local debugging.
+/tmp/
+
+.DS_Store
+*.test

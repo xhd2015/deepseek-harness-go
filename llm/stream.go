@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1569,12 +1570,68 @@ func (c *Client) encodeStreamRequest(req Request) ([]byte, error) {
 	}
 }
 
+// imageDataURL renders one inline image for OpenAI-style content parts.
+func imageDataURL(image Image) string {
+	return "data:" + image.MediaType + ";base64," + base64.StdEncoding.EncodeToString(image.Data)
+}
+
+func openAIToolContent(message Message) []any {
+	parts := make([]any, 0, len(message.Images)+1)
+	if message.Content != "" {
+		parts = append(parts, map[string]any{"type": "text", "text": message.Content})
+	}
+	for _, image := range message.Images {
+		parts = append(parts, map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": imageDataURL(image)},
+		})
+	}
+	return parts
+}
+
+func anthropicToolContent(message Message) any {
+	if len(message.Images) == 0 {
+		return message.Content
+	}
+	parts := make([]any, 0, len(message.Images)+1)
+	if message.Content != "" {
+		parts = append(parts, map[string]any{"type": "text", "text": message.Content})
+	}
+	for _, image := range message.Images {
+		parts = append(parts, map[string]any{
+			"type": "image",
+			"source": map[string]any{
+				"type":       "base64",
+				"media_type": image.MediaType,
+				"data":       base64.StdEncoding.EncodeToString(image.Data),
+			},
+		})
+	}
+	return parts
+}
+
+func responsesToolContent(message Message) []any {
+	parts := make([]any, 0, len(message.Images)+1)
+	if message.Content != "" {
+		parts = append(parts, map[string]any{"type": "input_text", "text": message.Content})
+	}
+	for _, image := range message.Images {
+		parts = append(parts, map[string]any{"type": "input_image", "image_url": imageDataURL(image)})
+	}
+	return parts
+}
+
 func openAIMessages(messages []Message) []any {
 	out := make([]any, 0, len(messages))
 	for _, message := range messages {
 		switch message.Role {
 		case "tool":
-			entry := map[string]any{"role": "tool", "tool_call_id": message.ToolCallID, "content": message.Content}
+			entry := map[string]any{"role": "tool", "tool_call_id": message.ToolCallID}
+			if len(message.Images) > 0 {
+				entry["content"] = openAIToolContent(message)
+			} else {
+				entry["content"] = message.Content
+			}
 			out = append(out, entry)
 		case "assistant":
 			entry := map[string]any{"role": "assistant"}
@@ -1674,14 +1731,14 @@ func anthropicMessages(messages []Message) (string, []any) {
 		case "tool":
 			blocks := []any{map[string]any{
 				"type": "tool_result", "tool_use_id": message.ToolCallID,
-				"content": message.Content, "is_error": message.IsError,
+				"content": anthropicToolContent(message), "is_error": message.IsError,
 			}}
 			for i+1 < len(messages) && messages[i+1].Role == "tool" {
 				i++
 				next := messages[i]
 				blocks = append(blocks, map[string]any{
 					"type": "tool_result", "tool_use_id": next.ToolCallID,
-					"content": next.Content, "is_error": next.IsError,
+					"content": anthropicToolContent(next), "is_error": next.IsError,
 				})
 			}
 			out = append(out, map[string]any{"role": "user", "content": blocks})
@@ -1822,7 +1879,11 @@ func encodeResponsesRequest(req Request) []byte {
 	for _, message := range req.Messages {
 		switch message.Role {
 		case "tool":
-			input = append(input, map[string]any{"type": "function_call_output", "call_id": message.ToolCallID, "output": message.Content})
+			output := any(message.Content)
+			if len(message.Images) > 0 {
+				output = responsesToolContent(message)
+			}
+			input = append(input, map[string]any{"type": "function_call_output", "call_id": message.ToolCallID, "output": output})
 		case "assistant":
 			if replay := responsesReplayItems(message.Replay); len(replay) > 0 {
 				input = append(input, replay...)

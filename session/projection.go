@@ -1,5 +1,7 @@
 package session
 
+import "encoding/json"
+
 // ProjectionBaseline mirrors SessionProjectionBaseline: the projection values
 // at one exact event cursor.
 type ProjectionBaseline struct {
@@ -41,6 +43,7 @@ func Baseline(header Header, events []Event) ProjectionBaseline {
 		"lastUsed": nil,
 		"next":     next,
 	}
+	values["todos"] = todosProjection(events)
 	return ProjectionBaseline{AsOfSeq: asOfSeq, Values: values}
 }
 
@@ -70,4 +73,25 @@ func SummaryProjections(entry ListEntry) map[string]any {
 		"asOfSeq": entry.LastSeq,
 		"values":  values,
 	}
+}
+
+// todosProjection folds the most recent todo/write snapshot. A new turn clears
+// the list until the agent writes it again; the finished checklist remains
+// visible after turn/end.
+func todosProjection(events []Event) any {
+	var value any
+	for _, event := range events {
+		switch event.Type {
+		case EventTurnStart:
+			value = nil
+		case EventTodoWrite:
+			var data struct {
+				Todos any `json:"todos"`
+			}
+			if err := json.Unmarshal(event.Data, &data); err == nil {
+				value = data.Todos
+			}
+		}
+	}
+	return value
 }

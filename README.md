@@ -14,18 +14,25 @@ the backend is new.
 
 ## Status
 
-Phase 1 is complete: a session can be listed, created (with or without a
-workspace), renamed, prompted, cancelled, paged, followed live and projected,
-and the chat page renders both sides of the conversation. Reasoning and answer
-tokens stream live and survive reconnects.
+A session can be listed, created (with or without a workspace), renamed,
+prompted, cancelled, paged, followed live and projected, and the chat page
+renders both sides of the conversation. Reasoning and answer tokens stream
+live and survive reconnects.
 
-The core model tools are implemented with DSH-compatible results:
-`bash`, `read`, `write`, `edit`, `glob` and `grep`. Oversized search results
-are spilled under the session directory so the model can page through them.
+All thirteen DSH model tools are implemented with DSH-compatible definitions
+and results: `bash`, `read`, `write`, `edit`, `glob`, `grep`, `todo_write`,
+`job_output`, `job_list`, `job_kill`, `read_image`, `web_search` and
+`web_fetch`. Commands can run in the background, image reads use the same
+content-addressed attachment store and can be sent to vision models, and web
+tools return the same trust notice, source list and truncation contracts.
+Oversized grep results are spilled under the session directory so the model can
+page through them.
 
-Deliberately out of scope for now: subagents, jobs, terminal, attachments and
-images, queue steering, search, federation, additional tools, and the Node
-host's zstd compression and cross-process log locking.
+Deliberately out of scope for now: subagents, the terminal and PTY tools, queue
+steering, federation, and the Node host's zstd compression and cross-process
+log locking. Background jobs are process-local and do not survive a restart.
+Foreground `bash` calls do not yet promote to a background job at their
+timeout; the command is stopped and the timeout marker is returned.
 
 ## Tools and permissions
 
@@ -39,8 +46,8 @@ gets the permission and sandbox modes recorded in its header:
 - `read-only` rejects file mutations.
 
 `write` and `edit` require the file to have been observed first, either by
-`read` or by an earlier successful write/edit in the same session. The
-observation memory is in-process and resets when the server restarts.
+`read`, `read_image`, or an earlier successful write/edit in the same session.
+The observation memory is in-process and resets when the server restarts.
 
 Approval prompts are not implemented; the approval policy is accepted and
 recorded, and mutations run without an interactive approval step. Shell
@@ -51,6 +58,28 @@ Like DSH, `bash` children do not inherit credential-shaped variables
 (`KEY`, `PASSWORD`, `SECRET`, `TOKEN`, case-insensitive) or ambient `DSH_*`
 variables. They receive the managed facts `DSH_HOME` (`~/.dsh-go`),
 `DSH_SHELL=1`, and `DSH_SESSION_ID`.
+
+`bash` with `run_in_background` registers the process in the in-memory job
+registry and returns its id immediately. `job_output` reads output produced
+since the previous read (with an optional wait), `job_list` lists the session's
+jobs, and `job_kill` requests cancellation. A completion notice is appended to
+a running turn, or wakes an idle session, unless the job was already awaited or
+killed by the model. The limit is ten concurrent jobs per session.
+
+`read_image` accepts PNG, JPEG, WebP and GIF files (including extension-less
+files whose magic bytes identify them), downscales oversized images, stores
+them under `~/.dsh-go/attachments/v1` by SHA-256, and returns both a text
+envelope and an image block for the model. The same attachment bytes are
+available to the UI through `session/attachment`. Unlike DSH, the Go reader
+passes bytes through unchanged when no downscale is needed, so EXIF
+orientation, animation and 16-bit PNG depth are left to the model provider.
+
+`web_search` and `web_fetch` treat external content as untrusted data.
+Searching uses the DeepSeek Search API when `DEEPSEEK_SEARCH_BASE_URL` is set
+(authorization reuses `DEEPSEEK_API_KEY`) and otherwise falls back to
+DuckDuckGo's HTML endpoint. Fetching rejects non-public addresses, follows
+same-origin redirects only, converts HTML to Markdown, and caps the response
+body and final text.
 
 ## Requirements
 
@@ -156,7 +185,8 @@ are serialized by parameter name, which is why session methods expect
 Implemented endpoints:
 
 - `session/list`, `create`, `rename`, `page`, `follow`, `control`, `prompt`,
-  `cancel`, `projections`, `modelCatalog`, `selectModel`, `getDraft`, `setDraft`
+  `cancel`, `projections`, `modelCatalog`, `selectModel`, `getDraft`, `setDraft`,
+  `attachment`
 - `workspace/follow`, `initializeDefault`, `create`
 - `$events`, `$invoke`
 
@@ -174,7 +204,9 @@ Sessions live under `~/.dsh-go/sessions` unless `--sessions-root` or
 
 The first line is the session header, every later line is one event. Unlike the
 Node host the log is plain JSONL, not zstd, and there is no lock file; one
-process owns a session. The event vocabulary and wire shapes match DSH v4 so
+process owns a session. Attachments are stored once under
+`~/.dsh-go/attachments/v1/objects/<sha256-prefix>/<sha256>` and referenced from
+session events by `sha256:<hex>` ids. The event vocabulary and wire shapes match DSH v4 so
 the existing frontend can project and render them. Session ids are bare UUIDs
 inside the header; the directory adds the `session-` prefix.
 
@@ -201,8 +233,9 @@ Flags (also see `dsh-go serve -h`):
 | `--base-url` | `https://api.deepseek.com/v1` | model endpoint base URL |
 | `--tool-root` | process cwd | fallback workspace and startup validation root for tools |
 
-Environment: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DSH_GO_SESSIONS_ROOT`,
-`DSH_GO_TOKEN`, `DSH_GO_PROVIDER`, `DSH_GO_MODEL`, `DSH_GO_REASONING_EFFORT`,
+Environment: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`,
+`DEEPSEEK_SEARCH_BASE_URL`, `DSH_GO_SESSIONS_ROOT`, `DSH_GO_TOKEN`,
+`DSH_GO_PROVIDER`, `DSH_GO_MODEL`, `DSH_GO_REASONING_EFFORT`,
 `DSH_GO_PROTOCOL`, `DSH_GO_ASSETS_DIR`, `DSH_GO_TOOL_ROOT`.
 
 By default the server binds loopback and has no authentication. `--token`

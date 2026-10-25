@@ -82,6 +82,9 @@ type PromptRequest struct {
 	Content        []ContentPart
 	RPCID          string
 	ClientTimeZone string
+	// Source replaces the default user-message source. Background-job
+	// completion notices use it to identify themselves as tool-jobs notices.
+	Source map[string]any
 }
 
 // Runner serializes turns per session.
@@ -92,9 +95,11 @@ type Runner struct {
 	clients map[string]*llm.Client
 	tools   *ToolExecutor
 
-	mu       sync.Mutex
-	cancels  map[string]context.CancelFunc
-	onStatus func(sessionID string, running bool)
+	mu             sync.Mutex
+	cancels        map[string]context.CancelFunc
+	onStatus       func(sessionID string, running bool)
+	pendingNotices map[string][]string
+	waking         map[string]bool
 }
 
 // New builds a runner.
@@ -152,11 +157,13 @@ func New(cfg Config) *Runner {
 		}
 	}
 	return &Runner{
-		cfg:     cfg,
-		catalog: catalog,
-		clients: clients,
-		tools:   tools,
-		cancels: map[string]context.CancelFunc{},
+		cfg:            cfg,
+		catalog:        catalog,
+		clients:        clients,
+		tools:          tools,
+		cancels:        map[string]context.CancelFunc{},
+		pendingNotices: map[string][]string{},
+		waking:         map[string]bool{},
 	}
 }
 
@@ -210,6 +217,7 @@ func (r *Runner) Start(parent context.Context, req PromptRequest) bool {
 			req.Session.SetBusy(false)
 			r.notifyStatusLocked(id, false)
 			r.mu.Unlock()
+			r.wakeIdle(req.Session)
 		}()
 		r.run(ctx, req)
 	}()
@@ -245,6 +253,7 @@ func (r *Runner) Close() {
 	for _, cancel := range pending {
 		cancel()
 	}
+	r.tools.closeJobs()
 }
 
 func (r *Runner) ensurePreamble(sess *session.Session) error {
@@ -362,15 +371,19 @@ func (r *Runner) startTurn(sess *session.Session, req PromptRequest, turn int, t
 	if content == nil {
 		content = []any{map[string]any{"type": "text", "text": ""}}
 	}
-	message, err := sess.AppendSurface(session.EventUserMessage, map[string]any{
-		"content": content,
-		"source": map[string]any{
+	source := req.Source
+	if source == nil {
+		source = map[string]any{
 			"kind":           "user",
 			"rpcId":          req.RPCID,
 			"clientTimeZone": req.ClientTimeZone,
-		},
-		"role": "user",
-		"id":   session.NewID(),
+		}
+	}
+	message, err := sess.AppendSurface(session.EventUserMessage, map[string]any{
+		"content": content,
+		"source":  source,
+		"role":    "user",
+		"id":      session.NewID(),
 	})
 	if err != nil {
 		return err
@@ -382,6 +395,86 @@ func (r *Runner) startTurn(sess *session.Session, req PromptRequest, turn int, t
 		return err
 	}
 	return nil
+}
+
+// notifyCompletion queues a background-job completion notice. An idle session
+// is woken with a new turn; a busy session receives the notice before its next
+// model step, which keeps the running turn's tool sequence intact.
+func (r *Runner) notifyCompletion(sess *session.Session, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	r.mu.Lock()
+	r.pendingNotices[sess.ID()] = append(r.pendingNotices[sess.ID()], text)
+	r.mu.Unlock()
+	r.wakeIdle(sess)
+}
+
+func (r *Runner) takeNotices(sessionID string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	notices := r.pendingNotices[sessionID]
+	if len(notices) == 0 {
+		return nil
+	}
+	delete(r.pendingNotices, sessionID)
+	return notices
+}
+
+// wakeIdle starts a notice turn when no turn is running. The waking marker
+// prevents two settling jobs from opening duplicate notice turns.
+func (r *Runner) wakeIdle(sess *session.Session) {
+	id := sess.ID()
+	r.mu.Lock()
+	if _, running := r.cancels[id]; running || r.waking[id] {
+		r.mu.Unlock()
+		return
+	}
+	r.waking[id] = true
+	r.mu.Unlock()
+
+	go func() {
+		notices := r.takeNotices(id)
+		r.mu.Lock()
+		delete(r.waking, id)
+		r.mu.Unlock()
+		if len(notices) == 0 {
+			return
+		}
+		text := strings.Join(notices, "\n\n")
+		if !r.Start(context.Background(), PromptRequest{
+			Session: sess,
+			Content: []ContentPart{{Type: "text", Text: text}},
+			Source: map[string]any{
+				"kind":    "tool-jobs",
+				"form":    "notice",
+				"summary": text,
+			},
+		}) {
+			r.mu.Lock()
+			r.pendingNotices[id] = append(notices, r.pendingNotices[id]...)
+			r.mu.Unlock()
+		}
+	}()
+}
+
+// appendPendingNotices writes queued completion notices into the transcript
+// between steps of an already-running turn.
+func (r *Runner) appendPendingNotices(sess *session.Session) {
+	notices := r.takeNotices(sess.ID())
+	if len(notices) == 0 {
+		return
+	}
+	text := strings.Join(notices, "\n\n")
+	if _, err := sess.AppendSurface(session.EventUserMessage, map[string]any{
+		"content": []any{map[string]any{"type": "text", "text": text}},
+		"source":  map[string]any{"kind": "tool-jobs", "form": "notice", "summary": text},
+		"role":    "user",
+		"id":      session.NewID(),
+	}); err != nil {
+		r.logf("session %s: append job notice: %v", sess.ID(), err)
+	}
 }
 
 func (r *Runner) ensureTitle(sess *session.Session, text string, messageSeq int64) error {

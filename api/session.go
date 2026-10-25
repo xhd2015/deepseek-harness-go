@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/xhd2015/deepseek-harness-go/agent"
@@ -326,4 +328,76 @@ func (s *Service) defaultCwd() string {
 		return cwd
 	}
 	return "/"
+}
+
+// attachment answers session/attachment. Only attachments referenced by the
+// session are served, so a caller cannot probe unrelated content-addressed
+// objects by id.
+func (s *Service) attachment(args json.RawMessage) (any, error) {
+	var request struct {
+		SessionID    string `json:"sessionId"`
+		AttachmentID string `json:"attachmentId"`
+	}
+	if err := decodeArgs(args, &request); err != nil {
+		return nil, fail(CodeBadRequest, err.Error())
+	}
+	if strings.TrimSpace(request.AttachmentID) == "" {
+		return nil, fail(CodeBadRequest, "attachmentId is required")
+	}
+	events, err := s.eventsOf(request.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	ref, referenced := referencedAttachment(events, request.AttachmentID)
+	if !referenced {
+		return nil, fail("ATTACHMENT_NOT_REFERENCED", "Image is not referenced by this session.")
+	}
+	home := s.cfg.DSHHome
+	if home == "" {
+		home = filepath.Join(s.cfg.HomeDir, ".dsh-go")
+	}
+	data, err := agent.LoadStoredAttachment(home, request.AttachmentID)
+	if err != nil {
+		return nil, fail(CodeInternal, fmt.Sprintf("cannot read attachment %s: %v", request.AttachmentID, err))
+	}
+	return map[string]any{
+		"attachment": ref,
+		"data":       base64.StdEncoding.EncodeToString(data),
+	}, nil
+}
+
+// referencedAttachment finds the durable attachment reference in a session's
+// events. Tool results carry the full ref next to the image block.
+func referencedAttachment(events []session.Event, attachmentID string) (map[string]any, bool) {
+	for _, event := range events {
+		var value any
+		if err := json.Unmarshal(event.Data, &value); err != nil {
+			continue
+		}
+		if ref := findAttachmentValue(value, attachmentID); ref != nil {
+			return ref, true
+		}
+	}
+	return nil, false
+}
+
+func findAttachmentValue(value any, attachmentID string) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		if id, _ := typed["attachmentId"].(string); id == attachmentID {
+			return typed
+		}
+		for _, child := range typed {
+			if ref := findAttachmentValue(child, attachmentID); ref != nil {
+				return ref
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if ref := findAttachmentValue(child, attachmentID); ref != nil {
+				return ref
+			}
+		}
+	}
+	return nil
 }

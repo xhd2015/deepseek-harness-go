@@ -64,6 +64,17 @@ func (e *ToolExecutor) bash(ctx context.Context, inv ToolInvocation, args map[st
 	cmd.Env = childEnvironment(os.Environ(), e.dshHome, inv.SessionID)
 	configureProcessGroup(cmd)
 
+	if boolArg(args, "run_in_background") {
+		job, err := e.jobs.register(inv, "bash", command)
+		if err != nil {
+			return err.Error(), true
+		}
+		if err := job.startProcess(cmd); err != nil {
+			return fmt.Sprintf("failed to spawn bash: %v", err), true
+		}
+		return fmt.Sprintf("started background job %s", job.id), false
+	}
+
 	stdout := &tailBuffer{limit: bashMaxOutputBytes}
 	stderr := &tailBuffer{limit: bashMaxOutputBytes}
 	cmd.Stdout = stdout

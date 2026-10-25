@@ -119,6 +119,7 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		DefaultCwd:  opts.DefaultCwd,
 		AgentPreset: DefaultPreset,
 		HomeDir:     opts.Home,
+		DSHHome:     filepath.Join(opts.Home, ".dsh-go"),
 		Logf:        logf,
 	})
 	srv, err := server.New(server.Config{

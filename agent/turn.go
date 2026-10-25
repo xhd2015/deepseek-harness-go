@@ -42,6 +42,7 @@ func (r *Runner) drive(ctx context.Context, sess *session.Session, turn int, rou
 			return
 		}
 		if step > 1 {
+			r.appendPendingNotices(sess)
 			if _, err := sess.Append(session.EventStepStart, map[string]any{"turn": turn, "step": step}); err != nil {
 				r.finishStepError(sess, turn, step, err)
 				return
@@ -202,20 +203,27 @@ func (r *Runner) appendToolCalls(sess *session.Session, turn, step int, blocks [
 }
 
 func (r *Runner) runTool(ctx context.Context, sess *session.Session, turn, step int, call pendingCall) {
-	output := "cancelled"
-	isError := true
+	outcome := ToolOutcome{Text: "cancelled", IsError: true}
 	if ctx.Err() == nil {
-		output, isError = r.tools.Execute(ctx, ToolInvocation{
+		outcome = r.tools.ExecuteOutcome(ctx, ToolInvocation{
 			SessionID:  sess.ID(),
 			SessionDir: sess.Dir(),
 			Cwd:        sess.Cwd(),
 			Name:       call.block.Name,
 			Arguments:  call.block.Arguments,
+			CallID:     call.block.ID,
+			RootCallID: call.block.ID,
+			Emit: func(eventType string, data any) error {
+				_, err := sess.Append(eventType, data)
+				return err
+			},
+			Notify: func(text string) {
+				r.notifyCompletion(sess, text)
+			},
+			Session: sess,
 		})
 	}
-	if len(output) > toolOutputLimit {
-		output = truncateUTF8(output, toolOutputLimit)
-	}
+	content := toolResultContent(outcome, call.block.ID)
 	data := map[string]any{
 		"turn": turn,
 		"step": step,
@@ -223,22 +231,61 @@ func (r *Runner) runTool(ctx context.Context, sess *session.Session, turn, step 
 			"id":         session.NewID(),
 			"role":       "tool",
 			"toolCallId": call.block.ID,
-			"content":    []any{map[string]any{"type": "text", "text": output}},
+			"content":    content,
 			"source":     map[string]any{"kind": "tool", "callId": call.block.ID},
-			"isError":    isError,
+			"isError":    outcome.IsError,
 		},
 		"sourceEventSeqs": []int64{call.seq},
 	}
-	if isError {
+	if outcome.Meta != nil {
+		data["meta"] = outcome.Meta
+	}
+	if outcome.IsError {
 		data["error"] = map[string]any{
 			"name":   "ToolError",
 			"code":   "TOOL_ERROR",
-			"reason": output,
+			"reason": outcome.Text,
 		}
 	}
 	if _, err := sess.AppendSurface(session.EventToolResult, data); err != nil {
 		r.logf("session %s: append tool result: %v", sess.ID(), err)
 	}
+}
+
+// toolResultContent returns the durable content blocks for one result. A
+// single-text result keeps the historical truncation; structured results
+// truncate only their text block so image attachments survive intact.
+func toolResultContent(outcome ToolOutcome, callID string) []any {
+	content := make([]any, 0, len(outcome.Content))
+	for _, raw := range outcome.Content {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		copied := make(map[string]any, len(block))
+		for key, value := range block {
+			copied[key] = value
+		}
+		content = append(content, copied)
+	}
+	if len(content) == 0 {
+		return []any{map[string]any{"type": "text", "text": truncateUTF8(outcome.Text, toolOutputLimit)}}
+	}
+	if len(outcome.Text) > toolOutputLimit {
+		outcome.Text = truncateUTF8(outcome.Text, toolOutputLimit)
+	}
+	for _, raw := range content {
+		block := raw.(map[string]any)
+		if block["type"] != "text" {
+			continue
+		}
+		if text, ok := block["text"].(string); ok {
+			block["text"] = truncateUTF8(text, toolOutputLimit)
+		}
+		return content
+	}
+	content = append([]any{map[string]any{"type": "text", "text": outcome.Text}}, content...)
+	return content
 }
 
 func (r *Runner) settleFailedAttempt(

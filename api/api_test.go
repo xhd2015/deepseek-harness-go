@@ -2,11 +2,15 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -980,4 +984,47 @@ func decodeItem(t *testing.T, raw []byte) result {
 
 func asFailure(err error, target **mux.Failure) bool {
 	return errors.As(err, target)
+}
+
+func TestSessionAttachmentServesOnlyReferencedImages(t *testing.T) {
+	f := newFixture(t)
+	opened := f.createSession(t)
+	data := []byte("\x89PNG\r\n\x1a\npayload")
+	sum := sha256.Sum256(data)
+	id := "sha256:" + hex.EncodeToString(sum[:])
+	path := filepath.Join(f.root, ".dsh-go", "attachments", "v1", "objects", hex.EncodeToString(sum[:])[:2], hex.EncodeToString(sum[:]))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ref := map[string]any{"attachmentId": id, "mediaType": "image/png", "bytes": len(data), "width": 1, "height": 1}
+	if _, err := opened.AppendSurface(session.EventToolResult, map[string]any{
+		"turn": 1, "step": 1,
+		"message": map[string]any{"role": "tool", "content": []any{map[string]any{
+			"type": "image", "attachment": ref,
+		}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	value := f.invoke(t, "session/attachment", map[string]any{"sessionId": opened.ID(), "attachmentId": id}).mustSucceed(t)
+	var attachment struct {
+		Attachment map[string]any `json:"attachment"`
+		Data       string         `json:"data"`
+	}
+	decode(t, value, &attachment)
+	if attachment.Attachment["attachmentId"] != id || attachment.Attachment["mediaType"] != "image/png" {
+		t.Fatalf("attachment = %+v", attachment.Attachment)
+	}
+	if attachment.Data != base64.StdEncoding.EncodeToString(data) {
+		t.Fatalf("data = %q", attachment.Data)
+	}
+
+	other := f.createSession(t)
+	f.invoke(t, "session/attachment", map[string]any{"sessionId": other.ID(), "attachmentId": id}).
+		mustFail(t, "ATTACHMENT_NOT_REFERENCED")
+	f.invoke(t, "session/attachment", map[string]any{"sessionId": "missing", "attachmentId": id}).
+		mustFail(t, "session/not-found")
 }

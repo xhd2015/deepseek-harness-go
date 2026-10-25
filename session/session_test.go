@@ -325,3 +325,41 @@ func TestCreateWithIDRejectsUsedSessionRetry(t *testing.T) {
 		t.Fatalf("error = %v, want already exists", err)
 	}
 }
+
+func TestBaselineFoldsTodoWritesAndResetsAtTurnStart(t *testing.T) {
+	store := newTestStore(t)
+	opened, err := store.Create("/tmp/todo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := opened.Append(EventTodoWrite, map[string]any{
+		"todos": []any{map[string]any{"content": "first", "status": "in_progress"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	baseline := Baseline(opened.Header(), opened.Events())
+	todos, ok := baseline.Values["todos"].([]any)
+	if !ok || len(todos) != 1 {
+		t.Fatalf("todos = %#v", baseline.Values["todos"])
+	}
+	if _, err := opened.Append(EventTurnStart, map[string]any{"turn": 1}); err != nil {
+		t.Fatal(err)
+	}
+	baseline = Baseline(opened.Header(), opened.Events())
+	if baseline.Values["todos"] != nil {
+		t.Fatalf("todos after turn/start = %#v, want nil", baseline.Values["todos"])
+	}
+	if _, err := opened.Append(EventTodoWrite, map[string]any{
+		"todos": []any{map[string]any{"content": "second", "status": "completed"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := opened.Append(EventTurnEnd, map[string]any{"turn": 1}); err != nil {
+		t.Fatal(err)
+	}
+	baseline = Baseline(opened.Header(), opened.Events())
+	todos, ok = baseline.Values["todos"].([]any)
+	if !ok || len(todos) != 1 || todos[0].(map[string]any)["content"] != "second" {
+		t.Fatalf("todos after turn/end = %#v", baseline.Values["todos"])
+	}
+}

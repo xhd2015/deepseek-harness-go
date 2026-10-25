@@ -81,12 +81,22 @@ func (b ContentBlock) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
+// Image is one model-visible inline image. Data is the encoded file content;
+// providers receive it as base64 or a data URL.
+type Image struct {
+	MediaType string
+	Data      []byte
+	Name      string
+}
+
 // Message is one model-visible history message. Blocks carries assistant
-// content in order; Content is used for plain text roles.
+// content in order; Content is used for plain text roles. Images carries
+// multimodal attachments for user and tool messages.
 type Message struct {
 	Role       string
 	Content    string
 	Blocks     []ContentBlock
+	Images     []Image
 	ToolCallID string
 	IsError    bool
 	Provider   string

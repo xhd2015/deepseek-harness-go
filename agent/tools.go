@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/xhd2015/deepseek-harness-go/llm"
+	"github.com/xhd2015/deepseek-harness-go/session"
 )
 
 const (
@@ -38,6 +39,24 @@ type ToolInvocation struct {
 	Cwd        string
 	Name       string
 	Arguments  string
+	CallID     string
+	RootCallID string
+	// Emit appends a log-only side-effect event to the owning session.
+	Emit func(eventType string, data any) error
+	// Notify schedules a completion notice for the owning session.
+	Notify func(text string)
+	// Session is the owning session, when the invocation is model-authored.
+	Session *session.Session
+}
+
+// ToolOutcome is one model-facing tool result. Content overrides the single
+// text block when a tool returns structured blocks such as an image.
+type ToolOutcome struct {
+	Text    string
+	IsError bool
+	Content []any
+	Meta    any
+	Present any
 }
 
 // ToolExecutor hosts the core tools this backend exposes. Every call resolves
@@ -51,6 +70,7 @@ type ToolExecutor struct {
 	enabled    bool
 	initErr    error
 	observed   observationStore
+	jobs       *jobManager
 }
 
 type observationStore struct {
@@ -76,7 +96,7 @@ func (o *observationStore) has(sessionID, path string) bool {
 // NewToolExecutor canonicalizes the configured workspace. An empty root uses
 // the process working directory, matching the DSH default workspace.
 func NewToolExecutor(root string) *ToolExecutor {
-	executor := &ToolExecutor{permission: "danger-full-access", sandbox: "danger-full-access"}
+	executor := &ToolExecutor{permission: "danger-full-access", sandbox: "danger-full-access", jobs: newJobManager()}
 	if strings.TrimSpace(root) == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -162,6 +182,10 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 						"type":        "string",
 						"description": "Working directory for this command. Defaults to the session workspace; a relative path is resolved against it.",
 					},
+					"run_in_background": map[string]any{
+						"type":        "boolean",
+						"description": "Run in the background and return a job id immediately (collect with job_output, stop with job_kill). No timeout applies.",
+					},
 				},
 				"required": []string{"description", "command"},
 			},
@@ -218,6 +242,99 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 			},
 		},
 		{
+			Name:        "todo_write",
+			Description: "Record and update a task list to plan multi-step work and show progress; skip it for trivial single-step tasks. Add one todo per concrete step before you start. While work remains, keep the todos being worked on `in_progress`, several only when work runs in parallel. Mark each todo `completed` as soon as it is done.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"todos": map[string]any{
+						"type":        "array",
+						"description": "The COMPLETE task list, replacing any previous list.",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"content": map[string]any{"type": "string", "description": "What the task is — a short imperative line."},
+								"status":  map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}, "description": "pending (not started) | in_progress (now) | completed (done)."},
+							},
+							"required":             []string{"content", "status"},
+							"additionalProperties": false,
+						},
+					},
+				},
+				"required": []string{"todos"},
+			},
+		},
+		{
+			Name:        "job_output",
+			Description: "Read a background job: output since the previous read for stream jobs, or the result of a finished final-output job.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"job_id":     map[string]any{"type": "string", "description": "Job id returned by the tool that started the background work."},
+					"wait":       map[string]any{"type": "boolean", "description": "Block until the job finishes or the timeout expires; a timed-out wait leaves the job running. Defaults to false."},
+					"timeout_ms": map[string]any{"type": "number", "description": "Max wait in milliseconds with wait: true. Defaults to and is capped by configuration."},
+				},
+				"required": []string{"job_id"},
+			},
+		},
+		{
+			Name:        "job_list",
+			Description: "List your background jobs (running and finished) with their ids, kinds, and statuses.",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			Name:        "job_kill",
+			Description: "Request cancellation of a running background job.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"job_id": map[string]any{"type": "string", "description": "Job id returned by the tool that started the background work."},
+					"reason": map[string]any{"type": "string", "description": "Optional short reason, recorded in the log and forwarded to the job."},
+				},
+				"required": []string{"job_id"},
+			},
+		},
+		{
+			Name:        "read_image",
+			Description: "Read a PNG/JPEG/WebP/GIF file and return the image itself. Large images are downscaled automatically; do not install image libraries or create thumbnails to inspect an image.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"file_path": map[string]any{"type": "string", "description": "Path to the image file, resolved by the filesystem backend."},
+				},
+				"required": []string{"file_path"},
+			},
+		},
+		{
+			Name:        "web_search",
+			Description: "Search the web for current information. Returns an optional summary answer and a list of source URLs.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"queries": map[string]any{
+						"type":        "array",
+						"description": "1–4 search queries; their results are merged.",
+						"items":       map[string]any{"type": "string"},
+					},
+				},
+				"required": []string{"queries"},
+			},
+		},
+		{
+			Name:        "web_fetch",
+			Description: "Fetch the content of a specific HTTP(S) URL and return it decoded to text.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"url": map[string]any{"type": "string", "description": "The HTTP(S) URL to fetch."},
+				},
+				"required": []string{"url"},
+			},
+		},
+		{
 			Name:        "grep",
 			Description: "Search file contents with a ripgrep regular expression. Returns matching lines with line numbers, grouped by file. Returns up to 250 matches; a larger result reports where the complete match list was saved.",
 			Parameters: map[string]any{
@@ -236,13 +353,19 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 // Execute runs one tool call and returns model-facing text plus whether the
 // invocation failed.
 func (e *ToolExecutor) Execute(ctx context.Context, inv ToolInvocation) (string, bool) {
+	outcome := e.ExecuteOutcome(ctx, inv)
+	return outcome.Text, outcome.IsError
+}
+
+// ExecuteOutcome runs one tool call and returns its structured result.
+func (e *ToolExecutor) ExecuteOutcome(ctx context.Context, inv ToolInvocation) ToolOutcome {
 	if !e.Enabled() {
-		return "tools are not enabled", true
+		return ToolOutcome{Text: "tools are not enabled", IsError: true}
 	}
 	var args map[string]any
 	if strings.TrimSpace(inv.Arguments) != "" {
 		if err := json.Unmarshal([]byte(inv.Arguments), &args); err != nil {
-			return "invalid tool arguments: " + err.Error(), true
+			return ToolOutcome{Text: "invalid tool arguments: " + err.Error(), IsError: true}
 		}
 	}
 	if args == nil {
@@ -250,19 +373,39 @@ func (e *ToolExecutor) Execute(ctx context.Context, inv ToolInvocation) (string,
 	}
 	switch inv.Name {
 	case "bash":
-		return e.bash(ctx, inv, args)
+		text, failed := e.bash(ctx, inv, args)
+		return ToolOutcome{Text: text, IsError: failed}
 	case "read":
-		return e.read(ctx, inv, args)
+		text, failed := e.read(ctx, inv, args)
+		return ToolOutcome{Text: text, IsError: failed}
 	case "write":
-		return e.write(ctx, inv, args)
+		text, failed := e.write(ctx, inv, args)
+		return ToolOutcome{Text: text, IsError: failed}
 	case "edit":
-		return e.edit(ctx, inv, args)
+		text, failed := e.edit(ctx, inv, args)
+		return ToolOutcome{Text: text, IsError: failed}
 	case "glob":
-		return e.glob(ctx, inv, args)
+		text, failed := e.glob(ctx, inv, args)
+		return ToolOutcome{Text: text, IsError: failed}
 	case "grep":
-		return e.grep(ctx, inv, args)
+		text, failed := e.grep(ctx, inv, args)
+		return ToolOutcome{Text: text, IsError: failed}
+	case "todo_write":
+		return e.todoWrite(inv, args)
+	case "job_output":
+		return e.jobOutput(ctx, inv, args)
+	case "job_list":
+		return e.jobList(inv)
+	case "job_kill":
+		return e.jobKill(inv, args)
+	case "read_image":
+		return e.readImage(ctx, inv, args)
+	case "web_search":
+		return e.webSearch(ctx, args)
+	case "web_fetch":
+		return e.webFetch(ctx, args)
 	default:
-		return "unknown tool: " + inv.Name, true
+		return ToolOutcome{Text: "unknown tool: " + inv.Name, IsError: true}
 	}
 }
 

@@ -18,6 +18,9 @@ const (
 	EventToolResult       = "tool/result"
 	EventSessionTitle     = "session/title"
 	EventWorkingDirectory = "working-directory/change"
+	EventTodoWrite        = "todo/write"
+	EventJobRegistered    = "job/registered"
+	EventJobSettled       = "job/settled"
 )
 
 // Turn end reasons.

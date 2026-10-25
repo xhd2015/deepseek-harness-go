@@ -40,6 +40,9 @@ type Config struct {
 	DefaultCwd  string
 	AgentPreset string
 	HomeDir     string
+	// DSHHome is the harness state directory holding attachments. It defaults
+	// to HomeDir/.dsh-go, the layout the runner uses.
+	DSHHome string
 	// Workspaces holds the directories the client groups Sessions by. A nil
 	// registry gets a fresh one seeded with DefaultCwd.
 	Workspaces *workspace.Registry
@@ -156,6 +159,8 @@ func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 		return s.getDraft(args)
 	case "session/setDraft":
 		return s.setDraft(args)
+	case "session/attachment":
+		return s.attachment(args)
 	case "workspace/initializeDefault":
 		return s.initializeDefaultWorkspace(args)
 	case "workspace/create":

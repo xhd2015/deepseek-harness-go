@@ -50,7 +50,7 @@ func writeTestFile(t *testing.T, path, content string) {
 func TestToolDefinitions(t *testing.T) {
 	executor, _ := newToolTestExecutor(t)
 	definitions := executor.Definitions()
-	want := []string{"bash", "read", "write", "edit", "glob", "grep"}
+	want := []string{"bash", "read", "write", "edit", "glob", "todo_write", "job_output", "job_list", "job_kill", "read_image", "web_search", "web_fetch", "grep"}
 	if len(definitions) != len(want) {
 		t.Fatalf("got %d tool definitions, want %d", len(definitions), len(want))
 	}

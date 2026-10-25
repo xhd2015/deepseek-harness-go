@@ -47,6 +47,7 @@ type ToolExecutor struct {
 	root       string
 	permission string
 	sandbox    string
+	dshHome    string
 	enabled    bool
 	initErr    error
 	observed   observationStore
@@ -94,6 +95,16 @@ func NewToolExecutor(root string) *ToolExecutor {
 	return executor
 }
 
+// SetDSHHome records the harness home exported to shell commands as
+// DSH_HOME. Sessions store this value at startup so every child observes the
+// same harness identity.
+func (e *ToolExecutor) SetDSHHome(home string) {
+	if e == nil {
+		return
+	}
+	e.dshHome = home
+}
+
 // SetPolicy records the permission/sandbox modes used for mutation checks.
 func (e *ToolExecutor) SetPolicy(permission, sandbox string) {
 	if e == nil {
@@ -129,6 +140,7 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 			Description: "Execute a bash command (`bash -c`) and return its stdout/stderr. " +
 				"Each call runs in a fresh shell; pass `workdir` instead of using `cd`. " +
 				"Provide `description` before `command` in the arguments. " +
+				"Credential-shaped variables and ambient `DSH_*` variables are scrubbed; managed `DSH_*` variables expose current harness environment facts. " +
 				"Before any delete or move, verify that the resolved absolute target path is the intended one; never run it against a computed path you have not checked. " +
 				"An unset variable expands to an empty string, so guard variables in such paths with `${VAR:?}`.",
 			Parameters: map[string]any{

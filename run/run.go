@@ -109,6 +109,7 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		Model:           catalog.Default.Model,
 		ReasoningEffort: catalog.Default.ReasoningEffort,
 		ToolRoot:        opts.ToolRoot,
+		DSHHome:         filepath.Join(opts.Home, ".dsh-go"),
 		Logf:            logf,
 	})
 	service := api.New(api.Config{

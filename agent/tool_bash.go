@@ -61,7 +61,7 @@ func (e *ToolExecutor) bash(ctx context.Context, inv ToolInvocation, args map[st
 	}
 	cmd := exec.Command(shell, "-c", command)
 	cmd.Dir = workdir
-	cmd.Env = os.Environ()
+	cmd.Env = childEnvironment(os.Environ(), e.dshHome, inv.SessionID)
 	configureProcessGroup(cmd)
 
 	stdout := &tailBuffer{limit: bashMaxOutputBytes}
@@ -123,6 +123,41 @@ func (e *ToolExecutor) bash(ctx context.Context, inv ToolInvocation, args map[st
 		return body, false
 	}
 	return appendStatus(body, strings.Join(markers, "\n")), false
+}
+
+// childEnvironment is the ambient environment minus credential-shaped names
+// and every DSH_* name, then the managed harness facts. DSH does the same so a
+// harness API key or an unrelated service token never reaches a child
+// implicitly; a caller that wants a secret in the shell must export it there
+// deliberately.
+func childEnvironment(parent []string, dshHome, sessionID string) []string {
+	env := make([]string, 0, len(parent)+3)
+	for _, entry := range parent {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			continue
+		}
+		upper := strings.ToUpper(key)
+		if strings.HasPrefix(upper, "DSH_") || sensitiveEnvName(upper) {
+			continue
+		}
+		env = append(env, entry)
+	}
+	if dshHome != "" {
+		env = append(env, "DSH_HOME="+dshHome)
+	}
+	env = append(env, "DSH_SHELL=1")
+	if sessionID != "" {
+		env = append(env, "DSH_SESSION_ID="+sessionID)
+	}
+	return env
+}
+
+func sensitiveEnvName(upper string) bool {
+	return strings.Contains(upper, "KEY") ||
+		strings.Contains(upper, "PASSWORD") ||
+		strings.Contains(upper, "SECRET") ||
+		strings.Contains(upper, "TOKEN")
 }
 
 func composeBashOutput(stdout, stderr *tailBuffer) string {

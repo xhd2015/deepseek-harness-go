@@ -68,6 +68,9 @@ type Config struct {
 	// recorded cwd, and the directory validated at startup. It does not limit
 	// reads. Empty uses the process working directory.
 	ToolRoot string
+	// DSHHome is the harness home exported to bash children as DSH_HOME.
+	// Empty omits the variable.
+	DSHHome string
 	// MaxSteps caps model steps per turn. Zero uses the default of 8.
 	MaxSteps int
 	Logf     func(format string, args ...any)
@@ -113,6 +116,7 @@ func New(cfg Config) *Runner {
 	}
 	tools := NewToolExecutor(cfg.ToolRoot)
 	tools.SetPolicy(cfg.PermissionPreset, cfg.SandboxMode)
+	tools.SetDSHHome(cfg.DSHHome)
 	if cfg.ToolRoot != "" && tools.InitError() != nil && cfg.Logf != nil {
 		cfg.Logf("tools disabled: %v", tools.InitError())
 	}

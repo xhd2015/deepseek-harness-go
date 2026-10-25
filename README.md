@@ -47,6 +47,11 @@ recorded, and mutations run without an interactive approval step. Shell
 commands run with the harness process's privileges: the file policy does not
 confine what a `bash` command itself writes with its own tools.
 
+Like DSH, `bash` children do not inherit credential-shaped variables
+(`KEY`, `PASSWORD`, `SECRET`, `TOKEN`, case-insensitive) or ambient `DSH_*`
+variables. They receive the managed facts `DSH_HOME` (`~/.dsh-go`),
+`DSH_SHELL=1`, and `DSH_SESSION_ID`.
+
 ## Requirements
 
 - Go 1.25 or newer.

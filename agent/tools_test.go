@@ -277,6 +277,43 @@ func TestBashExecutionOutputAndTimeout(t *testing.T) {
 	}
 }
 
+func TestBashManagedEnvironment(t *testing.T) {
+	executor, root := newToolTestExecutor(t)
+	home := filepath.Join(root, ".dsh-go")
+	executor.SetDSHHome(home)
+	inv := ToolInvocation{SessionID: "env-session"}
+
+	t.Setenv("DEEPSEEK_API_KEY", "harness-key")
+	t.Setenv("SERVICE_TOKEN", "service-token")
+	t.Setenv("DB_PASSWORD", "password")
+	t.Setenv("MY_SECRET", "secret")
+	t.Setenv("api_key", "lowercase-key")
+	t.Setenv("DSH_HOME", "/ambient/home")
+	t.Setenv("DSH_GO_TOOL_ROOT", "/ambient/root")
+
+	command := `printf '%s\n' "$DSH_HOME" "$DSH_SHELL" "$DSH_SESSION_ID" "${DEEPSEEK_API_KEY-unset}" "${SERVICE_TOKEN-unset}" "${DB_PASSWORD-unset}" "${MY_SECRET-unset}" "${api_key-unset}" "${DSH_GO_TOOL_ROOT-unset}" "${PATH:+set}"`
+	output, isError := callTool(t, executor, inv, "bash", map[string]any{"description": "Inspect managed environment", "command": command})
+	if isError {
+		t.Fatalf("environment command failed: %s", output)
+	}
+	want := strings.Join([]string{
+		home,
+		"1",
+		"env-session",
+		"unset",
+		"unset",
+		"unset",
+		"unset",
+		"unset",
+		"unset",
+		"set",
+		"",
+	}, "\n")
+	if output != want {
+		t.Fatalf("managed environment:\n%s\nwant:\n%s", output, want)
+	}
+}
+
 func TestBashValidation(t *testing.T) {
 	executor, _ := newToolTestExecutor(t)
 	inv := ToolInvocation{SessionID: "bash"}

@@ -1009,7 +1009,9 @@ func TestSessionAttachmentServesOnlyReferencedImages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	value := f.invoke(t, "session/attachment", map[string]any{"sessionId": opened.ID(), "attachmentId": id}).mustSucceed(t)
+	value := f.invoke(t, "session/attachment", map[string]any{
+		"request": map[string]any{"sessionId": opened.ID(), "attachmentId": id},
+	}).mustSucceed(t)
 	var attachment struct {
 		Attachment map[string]any `json:"attachment"`
 		Data       string         `json:"data"`
@@ -1023,8 +1025,10 @@ func TestSessionAttachmentServesOnlyReferencedImages(t *testing.T) {
 	}
 
 	other := f.createSession(t)
-	f.invoke(t, "session/attachment", map[string]any{"sessionId": other.ID(), "attachmentId": id}).
-		mustFail(t, "ATTACHMENT_NOT_REFERENCED")
-	f.invoke(t, "session/attachment", map[string]any{"sessionId": "missing", "attachmentId": id}).
-		mustFail(t, "session/not-found")
+	f.invoke(t, "session/attachment", map[string]any{
+		"request": map[string]any{"sessionId": other.ID(), "attachmentId": id},
+	}).mustFail(t, "ATTACHMENT_NOT_REFERENCED")
+	f.invoke(t, "session/attachment", map[string]any{
+		"request": map[string]any{"sessionId": "missing", "attachmentId": id},
+	}).mustFail(t, "session/not-found")
 }

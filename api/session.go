@@ -338,7 +338,7 @@ func (s *Service) attachment(args json.RawMessage) (any, error) {
 		SessionID    string `json:"sessionId"`
 		AttachmentID string `json:"attachmentId"`
 	}
-	if err := decodeArgs(args, &request); err != nil {
+	if err := decodeRequest(args, &request); err != nil {
 		return nil, fail(CodeBadRequest, err.Error())
 	}
 	if strings.TrimSpace(request.AttachmentID) == "" {

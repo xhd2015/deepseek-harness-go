@@ -1,3 +1,5 @@
+> Deepseek-harness says: everything is a plugin. And this project adds that: even server is also a plugin.
+
 # dsh-go
 
 A Go reimplementation of the **DeepSeek Harness backend**. It serves the real

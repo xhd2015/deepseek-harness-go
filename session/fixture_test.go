@@ -94,8 +94,11 @@ func TestReadsCapturedRealLogs(t *testing.T) {
 			if !ok {
 				t.Fatalf("modelSelection face missing from %v", baseline.Values)
 			}
-			if got["lastUsed"] != nil {
-				t.Errorf("lastUsed = %v, want nil", got["lastUsed"])
+			// Captured logs carry request/header rows, so the route the last
+			// request actually used is a real durable fact.
+			used, _ := got["lastUsed"].(*ModelSelection)
+			if want.model != nil && (used == nil || used.Provider != want.model.Provider) {
+				t.Errorf("lastUsed = %v, want the last request's %+v", got["lastUsed"], *want.model)
 			}
 			if want.model == nil {
 				if got["next"] != nil {
@@ -130,9 +133,9 @@ func TestReadsCapturedRealLogs(t *testing.T) {
 			for _, record := range page.Records {
 				switch record.Type {
 				case EventUserMessage:
-					sawUser = record.SurfaceOp != ""
+					sawUser = record.SurfaceOp != nil
 				case EventAssistantMessage:
-					sawAssistant = record.SurfaceOp != ""
+					sawAssistant = record.SurfaceOp != nil
 				}
 			}
 			if !sawUser {

@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -117,6 +120,7 @@ func TestRunRecordsTheFullTurn(t *testing.T) {
 		session.EventUserMessage,
 		session.EventSessionTitle,
 		session.EventStepStart,
+		session.EventRequestHeader,
 		session.EventAssistantMessage,
 		session.EventStepEnd,
 		session.EventTurnEnd,
@@ -134,7 +138,7 @@ func TestRunRecordsTheFullTurn(t *testing.T) {
 			t.Fatalf("event %d has seq %d time %d", i, event.Seq, event.Time)
 		}
 	}
-	if events[5].SurfaceOp != "append" || events[8].SurfaceOp != "append" {
+	if events[5].SurfaceOp == nil || events[9].SurfaceOp == nil {
 		t.Fatalf("messages are not surface events: %+v", events)
 	}
 
@@ -177,7 +181,7 @@ func TestRunRecordsTheFullTurn(t *testing.T) {
 			} `json:"source"`
 		} `json:"message"`
 	}
-	decode(t, events[8].Data, &assistant)
+	decode(t, events[9].Data, &assistant)
 	if assistant.Turn != 1 || assistant.Step != 1 {
 		t.Fatalf("assistant turn/step = %d/%d", assistant.Turn, assistant.Step)
 	}
@@ -373,4 +377,251 @@ func typesOf(events []session.Event) []string {
 		out[i] = event.Type
 	}
 	return out
+}
+
+// TestHistoryAppliesMessageEdits proves the model sees rewritten text and not
+// deleted messages, while the log keeps every original row.
+func TestHistoryAppliesMessageEdits(t *testing.T) {
+	fake := &fakeModel{answer: "ok"}
+	runner, opened := newTestAgent(t, fake)
+	user, err := opened.AppendSurface(session.EventUserMessage, map[string]any{
+		"role":    "user",
+		"id":      session.NewID(),
+		"content": []any{map[string]any{"type": "text", "text": "original question"}},
+	})
+	if err != nil {
+		t.Fatalf("append user: %v", err)
+	}
+	reply, err := opened.AppendSurface(session.EventAssistantMessage, map[string]any{
+		"turn": 1, "step": 1,
+		"message": map[string]any{
+			"role":    "assistant",
+			"id":      session.NewID(),
+			"content": []any{map[string]any{"type": "text", "text": "reply that should disappear"}},
+			"source":  map[string]any{"kind": "model"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("append assistant: %v", err)
+	}
+	if _, err := opened.Append(session.EventMessageEdit, map[string]any{
+		"edits": []map[string]any{
+			{"seq": user.Seq, "text": "corrected question"},
+			{"seq": reply.Seq, "deleted": true},
+		},
+	}); err != nil {
+		t.Fatalf("append edit: %v", err)
+	}
+
+	messages := runner.history(opened)
+	if len(messages) != 2 {
+		t.Fatalf("history has %d messages, want system plus the edited user message: %+v", len(messages), messages)
+	}
+	if messages[0].Role != "system" {
+		t.Fatalf("first message role = %q", messages[0].Role)
+	}
+	if messages[1].Content != "corrected question" {
+		t.Fatalf("user content = %q, want the rewritten text", messages[1].Content)
+	}
+	for _, message := range messages {
+		if strings.Contains(message.Content, "reply that should disappear") {
+			t.Fatal("a deleted message is still in model history")
+		}
+	}
+	// The durable log is unchanged: the removal is a projection, not a rewrite.
+	if got := len(opened.Events()); got != 3 {
+		t.Fatalf("log has %d events, want the two messages and the edit record", got)
+	}
+}
+
+// TestHistorySkipsEditsForVanishedNodes proves an edit naming a seq that is no
+// longer a current node is skipped instead of breaking the whole history.
+func TestHistorySkipsEditsForVanishedNodes(t *testing.T) {
+	fake := &fakeModel{answer: "ok"}
+	runner, opened := newTestAgent(t, fake)
+	if _, err := opened.AppendSurface(session.EventUserMessage, map[string]any{
+		"role":    "user",
+		"id":      session.NewID(),
+		"content": []any{map[string]any{"type": "text", "text": "keep me"}},
+	}); err != nil {
+		t.Fatalf("append user: %v", err)
+	}
+	if _, err := opened.Append(session.EventMessageEdit, map[string]any{
+		"edits": []map[string]any{
+			{"seq": 424242, "text": "vanished"},
+			{"seq": 424243, "deleted": true},
+		},
+	}); err != nil {
+		t.Fatalf("append edit: %v", err)
+	}
+	messages := runner.history(opened)
+	if len(messages) != 2 || messages[1].Content != "keep me" {
+		t.Fatalf("history = %+v", messages)
+	}
+}
+
+// TestPanickingTurnEndsWithAnError proves a fault inside one turn costs that
+// turn only: the log still reaches a terminal event with a failure the client
+// can render, instead of the process dying with the turn left open.
+func TestPanickingTurnEndsWithAnError(t *testing.T) {
+	fake := &fakeModel{answer: "unused"}
+	runner, opened := newTestAgent(t, fake)
+
+	func() {
+		defer runner.recoverTurn(opened, 7)
+		panic("decoder exploded")
+	}()
+
+	events := opened.Events()
+	if len(events) == 0 {
+		t.Fatal("a panicking turn wrote nothing")
+	}
+	last := events[len(events)-1]
+	if last.Type != session.EventTurnEnd {
+		t.Fatalf("last event = %s, want %s", last.Type, session.EventTurnEnd)
+	}
+	var data struct {
+		Turn   int `json:"turn"`
+		Reason struct {
+			Kind  string `json:"kind"`
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"reason"`
+	}
+	if err := json.Unmarshal(last.Data, &data); err != nil {
+		t.Fatalf("turn end data = %s: %v", last.Data, err)
+	}
+	if data.Turn != 7 || data.Reason.Kind != "error" {
+		t.Fatalf("turn end = %+v", data)
+	}
+	if data.Reason.Error.Code != "PANIC" || !strings.Contains(data.Reason.Error.Message, "decoder exploded") {
+		t.Fatalf("failure = %+v", data.Reason.Error)
+	}
+	// The session is usable again rather than stuck busy.
+	if opened.Busy() {
+		t.Fatal("session stayed busy after the recovered turn")
+	}
+}
+
+// scriptedModel answers each request with the next scripted SSE body, so a test
+// can drive a real multi-step turn: a tool call first, then whatever follows.
+type scriptedModel struct {
+	mu     sync.Mutex
+	bodies []string
+	step   int
+}
+
+func (m *scriptedModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	m.mu.Lock()
+	index := m.step
+	if index >= len(m.bodies) {
+		index = len(m.bodies) - 1
+	}
+	m.step++
+	body := m.bodies[index]
+	m.mu.Unlock()
+	w.Header().Set("Content-Type", "text/event-stream")
+	_, _ = w.Write([]byte(body))
+}
+
+func (m *scriptedModel) steps() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.step
+}
+
+// TestTurnRunsASecondToolCallingStep is the end-to-end form of the reported
+// failure: step 1 writes a file through a tool call, step 2 answers with nothing
+// but tool calls. A decoder that only survives the first shape kills the
+// process here.
+func TestTurnRunsASecondToolCallingStep(t *testing.T) {
+	workdir := t.TempDir()
+	model := &scriptedModel{bodies: []string{
+		// Step 1: a tool call with no prose before it.
+		"data: " + `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-w","type":"function","function":{"name":"write","arguments":"{\"file_path\":\"probe.txt\",\"content\":\"probe\"}"}}]}}]}` + "\n\n" +
+			"data: " + `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
+			"data: [DONE]\n\n",
+		// Step 2: again no prose, and two tool calls in one response.
+		"data: " + `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-e","type":"function","function":{"name":"edit","arguments":"{\"file_path\":\"probe.txt\",\"old_string\":\"probe\",\"new_string\":\"probed\"}"}}]}}]}` + "\n\n" +
+			"data: " + `{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call-b","type":"function","function":{"name":"bash","arguments":"{\"command\":\"cat probe.txt\"}"}}]}}]}` + "\n\n" +
+			"data: " + `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
+			"data: [DONE]\n\n",
+		// Step 3: the closing answer.
+		"data: " + `{"choices":[{"delta":{"content":"done"}}]}` + "\n\n" +
+			"data: " + `{"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+			"data: [DONE]\n\n",
+	}}
+	server := httptest.NewServer(model)
+	t.Cleanup(server.Close)
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	opened, err := store.Create(workdir, "std-no-subagent")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	runner := New(Config{
+		Client:   llm.New(llm.Config{BaseURL: server.URL, Model: "fake-model", APIKey: "k"}),
+		Provider: "fake-provider",
+		Model:    "fake-model",
+	})
+	t.Cleanup(runner.Close)
+
+	if !runner.Start(context.Background(), PromptRequest{
+		Session: opened, Content: []ContentPart{{Type: "text", Text: "write, edit and read the probe"}},
+		RPCID: "rpc-tools",
+	}) {
+		t.Fatal("Start reported the session was busy")
+	}
+	waitIdle(t, runner, opened)
+
+	if model.steps() != 3 {
+		t.Fatalf("model was called %d times, want 3", model.steps())
+	}
+	// The file was written and then edited, which only happens if both steps
+	// were dispatched.
+	content, err := os.ReadFile(filepath.Join(workdir, "probe.txt"))
+	if err != nil {
+		t.Fatalf("read probe: %v", err)
+	}
+	if string(content) != "probed" {
+		t.Fatalf("probe.txt = %q, want the edited content", content)
+	}
+	events := opened.Events()
+	last := events[len(events)-1]
+	if last.Type != session.EventTurnEnd {
+		t.Fatalf("last event = %s, want %s", last.Type, session.EventTurnEnd)
+	}
+	var end struct {
+		Reason struct {
+			Kind string `json:"kind"`
+		} `json:"reason"`
+	}
+	if err := json.Unmarshal(last.Data, &end); err != nil {
+		t.Fatalf("turn end: %v", err)
+	}
+	if end.Reason.Kind != "done" && end.Reason.Kind != "stop" && end.Reason.Kind != "completed" {
+		t.Fatalf("turn end reason = %+v", end.Reason)
+	}
+	for _, event := range events {
+		if event.Type == session.EventTurnEnd {
+			var data struct {
+				Reason struct {
+					Kind  string `json:"kind"`
+					Error struct {
+						Code string `json:"code"`
+					} `json:"error"`
+				} `json:"reason"`
+			}
+			_ = json.Unmarshal(event.Data, &data)
+			if data.Reason.Kind == "error" {
+				t.Fatalf("turn ended with an error: %s", event.Data)
+			}
+		}
+	}
 }

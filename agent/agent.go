@@ -71,6 +71,9 @@ type Config struct {
 	// DSHHome is the harness home exported to bash children as DSH_HOME.
 	// Empty omits the variable.
 	DSHHome string
+	// ModelsPath is the patch file the catalog was loaded from. Empty means the
+	// catalog came from the single-route fallback.
+	ModelsPath string
 	// MaxSteps caps model steps per turn. Zero uses the default of 8.
 	MaxSteps int
 	Logf     func(format string, args ...any)
@@ -85,6 +88,9 @@ type PromptRequest struct {
 	// Source replaces the default user-message source. Background-job
 	// completion notices use it to identify themselves as tool-jobs notices.
 	Source map[string]any
+	// Continuation opens a turn without appending a user message. History
+	// injection and editing use it to let the agent act on committed events.
+	Continuation bool
 }
 
 // Runner serializes turns per session.
@@ -169,6 +175,20 @@ func New(cfg Config) *Runner {
 
 // Catalog returns the model catalog this runner routes over.
 func (r *Runner) Catalog() *modelconfig.Catalog { return r.catalog }
+
+// ModelsPath returns the patch file the catalog was loaded from, or "" when it
+// came from the single-route fallback.
+func (r *Runner) ModelsPath() string { return r.cfg.ModelsPath }
+
+// ReplaceCatalog swaps the route catalog after a successful refresh. Running
+// turns keep the client they already resolved.
+func (r *Runner) ReplaceCatalog(catalog *modelconfig.Catalog, clients map[string]*llm.Client) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.catalog = catalog
+	r.cfg.Catalog = catalog
+	r.clients = clients
+}
 
 // Model returns the configured model name.
 func (r *Runner) Model() string { return r.cfg.Model }

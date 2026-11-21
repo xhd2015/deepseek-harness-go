@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"strings"
 
 	"github.com/xhd2015/deepseek-harness-go/llm"
@@ -22,7 +23,22 @@ func (r *Runner) run(ctx context.Context, req PromptRequest) {
 		r.logf("session %s: preamble: %v", sess.ID(), err)
 	}
 	turn := nextTurn(sess.Events())
-	if err := r.startTurn(sess, req, turn, TextContent(req.Content)); err != nil {
+	// A bug in one model turn must cost that turn, not the process: without
+	// this, a decoder fault leaves the turn open and takes every other session
+	// down with it.
+	defer r.recoverTurn(sess, turn)
+	r.driveTurn(ctx, req, sess, turn)
+}
+
+// driveTurn runs one turn, from its opening event to its close.
+func (r *Runner) driveTurn(ctx context.Context, req PromptRequest, sess *session.Session, turn int) {
+	started := r.startTurn
+	if req.Continuation {
+		// A continuation acts on history that was already committed (an injected
+		// batch or an edit), so it opens a turn without appending a user message.
+		started = r.startContinuationTurn
+	}
+	if err := started(sess, req, turn, TextContent(req.Content)); err != nil {
 		r.logf("session %s: start turn: %v", sess.ID(), err)
 		r.endTurn(sess, turn, map[string]any{"kind": "error", "error": failureOf(err)})
 		return
@@ -33,6 +49,34 @@ func (r *Runner) run(ctx context.Context, req PromptRequest) {
 		return
 	}
 	r.drive(ctx, sess, turn, route, client)
+}
+
+// recoverTurn closes a turn that panicked and reports the fault, so the log
+// keeps a terminal event and the server keeps running.
+func (r *Runner) recoverTurn(sess *session.Session, turn int) {
+	failure := recover()
+	if failure == nil {
+		return
+	}
+	r.logf("session %s: turn %d panicked: %v\n%s", sess.ID(), turn, failure, debug.Stack())
+	r.endTurn(sess, turn, map[string]any{
+		"kind": "error",
+		"error": map[string]any{
+			"code":    "PANIC",
+			"message": fmt.Sprintf("internal error: %v", failure),
+		},
+	})
+}
+
+// startContinuationTurn opens a turn on already-committed history.
+func (r *Runner) startContinuationTurn(sess *session.Session, _ PromptRequest, turn int, _ string) error {
+	if _, err := sess.Append(session.EventTurnStart, map[string]any{"turn": turn}); err != nil {
+		return err
+	}
+	if _, err := sess.Append(session.EventStepStart, map[string]any{"turn": turn, "step": 1}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *Runner) drive(ctx context.Context, sess *session.Session, turn int, route modelconfig.Route, client *llm.Client) {
@@ -47,6 +91,22 @@ func (r *Runner) drive(ctx context.Context, sess *session.Session, turn int, rou
 				r.finishStepError(sess, turn, step, err)
 				return
 			}
+		}
+		// The request header records the route and the assembled tool schemas a
+		// committed request actually used; consumers fold it into lastUsed.
+		if _, err := sess.Append(session.EventRequestHeader, map[string]any{
+			"header": map[string]any{
+				"config": map[string]any{
+					"provider":        route.Provider,
+					"model":           route.Model,
+					"reasoningEffort": route.ReasoningEffort,
+				},
+				"tools": r.tools.Definitions(),
+			},
+			"reason": "change",
+		}); err != nil {
+			r.finishStepError(sess, turn, step, err)
+			return
 		}
 		attempt := sess.BeginAssistantAttempt(turn, step)
 		completion, streamErr := client.Stream(ctx, llm.Request{
@@ -235,7 +295,6 @@ func (r *Runner) runTool(ctx context.Context, sess *session.Session, turn, step 
 			"source":     map[string]any{"kind": "tool", "callId": call.block.ID},
 			"isError":    outcome.IsError,
 		},
-		"sourceEventSeqs": []int64{call.seq},
 	}
 	if outcome.Meta != nil {
 		data["meta"] = outcome.Meta
@@ -247,7 +306,8 @@ func (r *Runner) runTool(ctx context.Context, sess *session.Session, turn, step 
 			"reason": outcome.Text,
 		}
 	}
-	if _, err := sess.AppendSurface(session.EventToolResult, data); err != nil {
+	// The call this answers belongs to the envelope, not to the payload.
+	if _, err := sess.AppendWithSource(session.EventToolResult, data, []int64{call.seq}); err != nil {
 		r.logf("session %s: append tool result: %v", sess.ID(), err)
 	}
 }

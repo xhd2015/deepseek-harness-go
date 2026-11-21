@@ -11,9 +11,10 @@ import (
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := NewStore(t.TempDir())
+	// Plain JSONL keeps fixtures readable; the zstd path has its own tests.
+	store, err := NewStoreWithConfig(Config{Root: t.TempDir(), Compression: CompressionNone})
 	if err != nil {
-		t.Fatalf("NewStore: %v", err)
+		t.Fatalf("NewStoreWithConfig: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
@@ -25,7 +26,7 @@ func TestCreateWritesHeaderAndAppendAssignsSeqs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if opened.ID() == "" || len(opened.ID()) != 36 {
+	if !strings.HasPrefix(opened.ID(), SessionPrefix) || len(opened.ID()) != len(SessionPrefix)+36 {
 		t.Fatalf("unexpected id %q", opened.ID())
 	}
 	if opened.LastSeq() != -1 {
@@ -45,12 +46,15 @@ func TestCreateWritesHeaderAndAppendAssignsSeqs(t *testing.T) {
 		t.Fatalf("second seq = %d, want 1", second.Seq)
 	}
 	events := opened.Events()
-	if len(events) != 2 || events[0].SurfaceOp != "append" {
+	if len(events) != 2 || events[0].SurfaceOp == nil {
 		t.Fatalf("events = %+v", events)
 	}
 
 	// Reopen from a second store to prove the log round-trips through disk.
-	reopened, err := NewStore(store.Root())
+	if err := opened.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := NewStoreWithConfig(Config{Root: store.Root(), Compression: CompressionNone})
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
@@ -252,7 +256,7 @@ func TestLogFileUsesV4Layout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	want := filepath.Join(store.Root(), Slug("/tmp/layout"), DirPrefix+opened.ID(), FileName)
+	want := filepath.Join(store.Root(), Slug("/tmp/layout"), opened.ID(), GenerationName(FormatVersion, CompressionNone))
 	if _, err := os.Stat(want); err != nil {
 		t.Fatalf("expected log at %s: %v", want, err)
 	}
@@ -260,8 +264,8 @@ func TestLogFileUsesV4Layout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	var header Header
-	if err := json.Unmarshal(raw[:firstLine(t, raw)], &header); err != nil {
+	header, _, err := readHeaderPrefix(CompressionNone, raw)
+	if err != nil {
 		t.Fatalf("decode header: %v", err)
 	}
 	if header.Version != 4 || header.Type != "session" || header.ID != opened.ID() {
@@ -301,11 +305,11 @@ func TestCreateWithIDReusesBlankSessionOnRetry(t *testing.T) {
 	if second.ID() != first.ID() || second.Header().AgentPreset != "std-no-subagent" {
 		t.Fatalf("retry opened %+v, want existing %q", second.Header(), first.ID())
 	}
-	header, events, err := readLog(logPath(first.Dir()))
+	header, events, err := readLog(first.Path())
 	if err != nil {
 		t.Fatalf("readLog: %v", err)
 	}
-	if header.ID != "retry-id" || len(events) != 0 {
+	if header.ID != "session-retry-id" || len(events) != 0 {
 		t.Fatalf("header=%+v events=%d, want one blank header", header, len(events))
 	}
 }

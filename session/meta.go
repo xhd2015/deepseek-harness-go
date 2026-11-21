@@ -26,6 +26,7 @@ type ListEntry struct {
 	Title          string
 	LastPromptAt   *int64
 	ModelSelection *ModelSelection
+	LastUsed       *ModelSelection
 	Busy           bool
 }
 
@@ -52,7 +53,7 @@ func summarize(header Header, events []Event) ListEntry {
 				entry.Title = title.Title
 			}
 		case EventUserMessage:
-			if event.SurfaceOp != "" && event.Time > 0 {
+			if event.SurfaceOp != nil && event.Time > 0 {
 				at := event.Time
 				entry.LastPromptAt = &at
 			}
@@ -61,9 +62,30 @@ func summarize(header Header, events []Event) ListEntry {
 				current := selection
 				entry.ModelSelection = &current
 			}
+		case EventRequestHeader:
+			if used, ok := requestHeaderSelection(event); ok {
+				entry.LastUsed = used
+			}
 		}
 	}
 	return entry
+}
+
+// requestHeaderSelection reads the route a committed request actually ran on.
+func requestHeaderSelection(event Event) (*ModelSelection, bool) {
+	var data struct {
+		Header struct {
+			Config ModelSelection `json:"config"`
+		} `json:"header"`
+	}
+	if err := json.Unmarshal(event.Data, &data); err != nil {
+		return nil, false
+	}
+	config := data.Header.Config
+	if config.Provider == "" || config.Model == "" {
+		return nil, false
+	}
+	return &config, true
 }
 
 // DisplayTitle returns the title shown in lists.
@@ -104,19 +126,5 @@ func NewID() string {
 	)
 }
 
-// Slug converts a working directory into the directory name the session log
-// lives under, matching the Harness layout: /a/b/c becomes --a-b-c--.
-func Slug(cwd string) string {
-	trimmed := strings.TrimSpace(cwd)
-	trimmed = strings.Trim(trimmed, "/\\")
-	if trimmed == "" {
-		return "--root--"
-	}
-	replacer := strings.NewReplacer(
-		"/", "-",
-		"\\", "-",
-		":", "-",
-		"\x00", "-",
-	)
-	return "--" + replacer.Replace(trimmed) + "--"
-}
+// NewSessionID returns a DeepSeek Harness shaped session id.
+func NewSessionID() string { return SessionPrefix + NewID() }

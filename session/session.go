@@ -1,12 +1,15 @@
 // Package session stores the durable event log of one chat session using the
-// DeepSeek Harness v4 JSONL layout, minus the compression and cross-process
-// locking the Node host adds.
+// DeepSeek Harness v4 layout: one immutable generation per session directory,
+// concatenated checksummed Zstandard frames by default, and a cross-process
+// write lease in session.lock.
 //
 // On-disk shape:
 //
-//	<root>/<cwd-slug>/session-<id>/session.v4.jsonl
+//	<root>/<project-key>/session-<id>/session.v4.jsonl.zstd
 //
-// The first line is the session header; every later line is one event.
+// The first frame is exactly the session header line; every later frame is one
+// append batch of event lines. A plain `session.v4.jsonl` artifact uses the same
+// row framing without compression. The two encodings never share one root.
 package session
 
 import (
@@ -17,15 +20,6 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-)
-
-const (
-	// FormatVersion is the log format this package reads and writes.
-	FormatVersion = 4
-	// FileName is the log file inside a session directory.
-	FileName = "session.v4.jsonl"
-	// DirPrefix prefixes every session directory name.
-	DirPrefix = "session-"
 )
 
 // Header is the first line of a session log.
@@ -70,13 +64,15 @@ type WireHeader struct {
 	AgentPreset     string `json:"agentPreset,omitempty"`
 }
 
-// Event is one durable session event in wire form.
+// Event is one durable session event in wire form. The envelope is fixed:
+// type, seq, time, data, and the optional surfaceOp, sourceEventSeqs and
+// ignorable fields.
 type Event struct {
 	Type            string          `json:"type"`
 	Seq             int64           `json:"seq"`
 	Time            int64           `json:"time"`
 	Data            json.RawMessage `json:"data"`
-	SurfaceOp       string          `json:"surfaceOp,omitempty"`
+	SurfaceOp       *SurfaceOp      `json:"surfaceOp,omitempty"`
 	SourceEventSeqs []int64         `json:"sourceEventSeqs,omitempty"`
 	Ignorable       bool            `json:"ignorable,omitempty"`
 }
@@ -95,9 +91,14 @@ func EncodeData(value any) (json.RawMessage, error) {
 
 // Session is one opened event log.
 type Session struct {
-	store  *Store
-	dir    string
-	header Header
+	store       *Store
+	dir         string
+	path        string
+	header      Header
+	compression Compression
+	encoder     *frameEncoder
+	hold        *lease
+	writable    bool
 
 	mu     sync.Mutex
 	events []Event
@@ -121,11 +122,17 @@ func (s *Session) ID() string { return s.header.ID }
 // Dir returns the directory that holds the log.
 func (s *Session) Dir() string { return s.dir }
 
+// Path returns the absolute artifact path this session reads and appends.
+func (s *Session) Path() string { return s.path }
+
 // Header returns the session header.
 func (s *Session) Header() Header { return s.header }
 
 // Cwd returns the session working directory.
 func (s *Session) Cwd() string { return s.header.Cwd }
+
+// Writable reports whether this handle owns the write lease.
+func (s *Session) Writable() bool { return s.writable }
 
 // LastSeq returns the newest durable seq, or -1 for an empty log.
 func (s *Session) LastSeq() int64 {
@@ -179,27 +186,91 @@ func (s *Session) AppendSurface(typ string, data any) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
-	return s.append(Event{Type: typ, Data: raw, SurfaceOp: "append"})
+	return s.append(Event{Type: typ, Data: raw, SurfaceOp: SplitSurface})
 }
 
-func (s *Session) append(event Event) (Event, error) {
+// AppendWithSource records one surface event that cites earlier sources.
+func (s *Session) AppendWithSource(typ string, data any, sources []int64) (Event, error) {
+	raw, err := EncodeData(data)
+	if err != nil {
+		return Event{}, err
+	}
+	event := Event{Type: typ, Data: raw, SourceEventSeqs: sources}
+	if SurfaceType(typ) {
+		event.SurfaceOp = SplitSurface
+	}
+	return s.append(event)
+}
+
+// AppendEvents commits one contiguous batch as a single physical frame, so a
+// failed write cannot leave half a batch behind.
+func (s *Session) AppendEvents(events []Event) ([]Event, error) {
+	if len(events) == 0 {
+		return nil, nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return Event{}, errors.New("session: log is closed")
+		return nil, errors.New("session: log is closed")
 	}
-	event.Seq = s.lastSeqLocked() + 1
-	if event.Time == 0 {
-		event.Time = time.Now().UnixMilli()
+	if !s.writable {
+		return nil, errors.New("session: log is read-only")
 	}
-	line, err := json.Marshal(event)
+	committed := make([]Event, 0, len(events))
+	next := s.lastSeqLocked() + 1
+	var lines []byte
+	for _, event := range events {
+		event.Seq = next
+		next++
+		if event.Time == 0 {
+			event.Time = time.Now().UnixMilli()
+		}
+		if SurfaceType(event.Type) && event.SurfaceOp == nil {
+			event.SurfaceOp = SplitSurface
+		}
+		line, err := json.Marshal(event)
+		if err != nil {
+			return nil, fmt.Errorf("session: encode event: %w", err)
+		}
+		lines = append(lines, line...)
+		lines = append(lines, '\n')
+		committed = append(committed, event)
+	}
+	if err := s.writeFrameLocked(lines); err != nil {
+		return nil, err
+	}
+	for _, event := range committed {
+		s.events = append(s.events, event)
+	}
+	for _, event := range committed {
+		s.notifyLocked(event)
+	}
+	return committed, nil
+}
+
+func (s *Session) append(event Event) (Event, error) {
+	committed, err := s.AppendEvents([]Event{event})
 	if err != nil {
-		return Event{}, fmt.Errorf("session: encode event: %w", err)
+		return Event{}, err
 	}
-	if _, err := s.file.Write(append(line, '\n')); err != nil {
-		return Event{}, fmt.Errorf("session: append event: %w", err)
+	return committed[0], nil
+}
+
+// writeFrameLocked encodes one append batch as one physical frame.
+func (s *Session) writeFrameLocked(lines []byte) error {
+	var payload []byte
+	if s.compression == CompressionZstd {
+		payload = s.encoder.compressFrame(lines)
+	} else {
+		payload = lines
 	}
-	s.events = append(s.events, event)
+	if _, err := s.file.Write(payload); err != nil {
+		return fmt.Errorf("session: append event: %w", err)
+	}
+	return nil
+}
+
+func (s *Session) notifyLocked(event Event) {
 	notify := event
 	for _, ch := range s.subs {
 		select {
@@ -218,7 +289,6 @@ func (s *Session) append(event Event) (Event, error) {
 			close(ch)
 		}
 	}
-	return event, nil
 }
 
 // Subscribe streams events appended after the call. The returned function
@@ -304,7 +374,7 @@ func (s *Session) FollowSnapshot() ([]Event, AssistantStreamBaseline, <-chan Fee
 	return events, baseline, ch, cancel
 }
 
-// Close flushes and releases the log file.
+// Close flushes and releases the log file and the write lease.
 func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -320,16 +390,170 @@ func (s *Session) Close() error {
 		delete(s.feedSubs, id)
 		close(ch)
 	}
+	var firstErr error
 	if s.file != nil {
-		err := s.file.Close()
+		if err := s.file.Sync(); err != nil {
+			firstErr = err
+		}
+		if err := s.file.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 		s.file = nil
-		return err
 	}
-	return nil
+	if s.encoder != nil {
+		s.encoder.release()
+		s.encoder = nil
+	}
+	if err := s.hold.release(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	s.hold = nil
+	return firstErr
 }
 
-func newSession(store *Store, dir string, header Header, events []Event, file *os.File) *Session {
-	return &Session{store: store, dir: dir, header: header, events: events, file: file}
+// ReadHeader reads one header line from an artifact byte prefix.
+func readHeaderPrefix(compression Compression, raw []byte) (Header, int, error) {
+	if compression == CompressionZstd {
+		frames, _, err := zstdFrames(raw)
+		if err != nil {
+			return Header{}, 0, err
+		}
+		if len(frames) == 0 {
+			return Header{}, 0, errTornTail
+		}
+		decoder, err := newFrameDecoder()
+		if err != nil {
+			return Header{}, 0, err
+		}
+		defer decoder.release()
+		plain, err := decoder.decompressFrame(raw[frames[0].start:frames[0].end])
+		if err != nil {
+			return Header{}, 0, err
+		}
+		line, _, err := splitLine(plain)
+		if err != nil {
+			return Header{}, 0, err
+		}
+		// This store materializes the header alone in its first frame, but an
+		// artifact written by an earlier host may carry the header and its
+		// first batch together; only the first line is the header either way.
+		header, err := DecodeHeader(line)
+		return header, frames[0].end, err
+	}
+	line, _, err := splitLine(raw)
+	if err != nil {
+		return Header{}, 0, err
+	}
+	header, err := DecodeHeader(line)
+	if err != nil {
+		return Header{}, 0, err
+	}
+	return header, len(line) + 1, nil
 }
 
-func logPath(dir string) string { return filepath.Join(dir, FileName) }
+// splitLine returns the first newline-terminated line and the remaining bytes.
+func splitLine(raw []byte) ([]byte, []byte, error) {
+	for index, b := range raw {
+		if b == '\n' {
+			return raw[:index], raw[index+1:], nil
+		}
+	}
+	return nil, nil, errTornTail
+}
+
+// decodeArtifact decodes a whole artifact into its header and events.
+func decodeArtifact(raw []byte, compression Compression) (Header, []Event, int, error) {
+	plain, err := decodeLog(raw, compression)
+	if err != nil {
+		return Header{}, nil, 0, err
+	}
+	header, rest, err := splitLine(plain)
+	if err != nil {
+		return Header{}, nil, 0, err
+	}
+	parsed, err := DecodeHeader(header)
+	if err != nil {
+		return Header{}, nil, 0, err
+	}
+	var events []Event
+	next := int64(0)
+	for len(rest) > 0 {
+		var line []byte
+		line, rest, err = splitLine(rest)
+		if err != nil {
+			break
+		}
+		if len(line) == 0 {
+			continue
+		}
+		event, err := DecodeEvent(line, next)
+		if err != nil {
+			return Header{}, nil, 0, err
+		}
+		next++
+		events = append(events, event)
+	}
+	return parsed, events, len(plain), nil
+}
+
+// logDir resolves one session directory for an id, accepting both the canonical
+// encoded segment and the legacy `session-<uuid>` spelling already on disk.
+func (s *Store) logDir(id string) (string, error) {
+	normalized := NormalizeSessionID(id)
+	segment, err := encodeSegment(normalized)
+	if err != nil {
+		return "", err
+	}
+	projects, err := os.ReadDir(s.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("session: list root: %w", err)
+	}
+	// A store written before compatible ids carried the bare UUID in the header
+	// but the prefixed name on disk; all spellings resolve to one directory.
+	names := []string{segment, NormalizeSessionID(id), normalized}
+	var matches []string
+	for _, project := range projects {
+		if !project.IsDir() {
+			continue
+		}
+		projectPath := filepath.Join(s.root, project.Name())
+		for _, name := range names {
+			if name == "" {
+				continue
+			}
+			candidate := filepath.Join(projectPath, name)
+			if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+				matches = append(matches, candidate)
+			}
+		}
+	}
+	unique := map[string]bool{}
+	var deduped []string
+	for _, match := range matches {
+		if unique[match] {
+			continue
+		}
+		unique[match] = true
+		deduped = append(deduped, match)
+	}
+	switch len(deduped) {
+	case 0:
+		return "", ErrNotFound
+	case 1:
+		return deduped[0], nil
+	default:
+		return "", fmt.Errorf("session: id %q appears in %d project directories", id, len(deduped))
+	}
+}
+
+func newSession(store *Store, dir, path string, header Header, compression Compression,
+	events []Event, file *os.File, encoder *frameEncoder, hold *lease) *Session {
+	return &Session{
+		store: store, dir: dir, path: path, header: header,
+		compression: compression, events: events, file: file,
+		encoder: encoder, hold: hold, writable: file != nil,
+	}
+}

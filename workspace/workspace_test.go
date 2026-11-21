@@ -2,6 +2,8 @@ package workspace
 
 import (
 	"encoding/hex"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -134,5 +136,80 @@ func waitChange(t *testing.T, changes <-chan struct{}) {
 	case <-changes:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for a workspace change")
+	}
+}
+
+// TestPersistedUnitMatchesHarnessLayout proves the registry writes the same
+// versioned unit the Host writes, and reads one it did not create.
+func TestPersistedUnitMatchesHarnessLayout(t *testing.T) {
+	dir := t.TempDir()
+	registry, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	project := filepath.Join(dir, "project")
+	item, created := registry.Add(project)
+	if !created {
+		t.Fatal("Add did not report a new workspace")
+	}
+	registry.SetSessions(project, []string{"session-a", "session-b"})
+
+	path := filepath.Join(dir, FileName)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read unit: %v", err)
+	}
+	var unit unitFile
+	if err := json.Unmarshal(raw, &unit); err != nil {
+		t.Fatalf("decode unit: %v", err)
+	}
+	if unit.Unit.Name != UnitName || unit.Unit.Version != UnitVersion {
+		t.Fatalf("unit header = %+v", unit.Unit)
+	}
+	if !unit.Global.Initialized || len(unit.Global.WorkspaceIDs) != 1 || unit.Global.WorkspaceIDs[0] != item.ID {
+		t.Fatalf("global = %+v", unit.Global)
+	}
+	record := unit.Tables["workspaces"][item.ID]
+	if record["path"] != project || record["title"] != "project" {
+		t.Fatalf("record = %+v", record)
+	}
+	if ids, _ := record["sessionIds"].([]any); len(ids) != 2 {
+		t.Fatalf("sessionIds = %+v", record["sessionIds"])
+	}
+	if _, ok := record["createdAt"].(string); !ok {
+		t.Fatalf("createdAt = %+v", record["createdAt"])
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat unit: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("unit permissions = %o", perm)
+	}
+
+	// Reopening reads the persisted rows back, including membership.
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	got, ok := reopened.Get(item.ID)
+	if !ok {
+		t.Fatalf("workspace %s missing after reopen", item.ID)
+	}
+	if got.Path != project || len(got.SessionIDs) != 2 {
+		t.Fatalf("reopened = %+v", got)
+	}
+}
+
+// TestUnsupportedUnitVersionIsRefused proves a newer layout is not silently
+// rewritten into an older one.
+func TestUnsupportedUnitVersionIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	body := `{"unit":{"name":"workspace","version":99},"global":{},"tables":{}}`
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte(body), 0o600); err != nil {
+		t.Fatalf("write unit: %v", err)
+	}
+	if _, err := Open(dir); err == nil {
+		t.Fatal("a newer unit version was accepted")
 	}
 }

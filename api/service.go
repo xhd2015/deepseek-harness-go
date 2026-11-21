@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/xhd2015/deepseek-harness-go/agent"
+	"github.com/xhd2015/deepseek-harness-go/llm"
 	"github.com/xhd2015/deepseek-harness-go/modelconfig"
 	"github.com/xhd2015/deepseek-harness-go/mux"
 	"github.com/xhd2015/deepseek-harness-go/session"
@@ -40,11 +42,23 @@ type Config struct {
 	DefaultCwd  string
 	AgentPreset string
 	HomeDir     string
+	// DataDir is this backend's data directory. It defaults to
+	// HomeDir/.dsh-go and is deliberately distinct from DSH's ~/.dsh.
+	DataDir string
 	// DSHHome is the harness state directory holding attachments. It defaults
-	// to HomeDir/.dsh-go, the layout the runner uses.
+	// to DataDir.
 	DSHHome string
+	// Drafts is the durable composer draft store; nil uses an in-memory one.
+	Drafts *Drafts
+	// ReloadModels re-reads the model catalog for session/refreshModelCatalog.
+	ReloadModels func(path string) (*modelconfig.Catalog, map[string]*llm.Client, error)
+	// SaveDefaultModel persists session/selectDefaultModel.
+	SaveDefaultModel func(selection modelconfig.Selection) error
+	// SetDefaultModel applies a new deployment default for sessions created
+	// after this call.
+	SetDefaultModel func(selection modelconfig.Selection)
 	// Workspaces holds the directories the client groups Sessions by. A nil
-	// registry gets a fresh one seeded with DefaultCwd.
+	// registry gets a fresh in-memory one seeded with DefaultCwd.
 	Workspaces *workspace.Registry
 	Logf       func(format string, args ...any)
 }
@@ -54,7 +68,8 @@ type Service struct {
 	cfg Config
 	// Workspaces is the Workspace registry this service answers with.
 	Workspaces *workspace.Registry
-	drafts     drafts
+	drafts     *Drafts
+	receipts   requestReceipts
 	events     *eventHub
 }
 
@@ -63,14 +78,22 @@ func New(cfg Config) *Service {
 	if cfg.HomeDir == "" {
 		cfg.HomeDir, _ = os.UserHomeDir()
 	}
+	if cfg.DataDir == "" {
+		cfg.DataDir = filepath.Join(cfg.HomeDir, ".dsh-go")
+	}
+	if cfg.DSHHome == "" {
+		cfg.DSHHome = cfg.DataDir
+	}
 	if cfg.Workspaces == nil {
 		cfg.Workspaces = workspace.NewRegistry()
 	}
 	if cfg.DefaultCwd != "" {
 		cfg.Workspaces.Add(cfg.DefaultCwd)
 	}
-	service := &Service{cfg: cfg, Workspaces: cfg.Workspaces, events: newEventHub()}
-	service.drafts.texts = map[string]string{}
+	if cfg.Drafts == nil {
+		cfg.Drafts = &Drafts{texts: map[string]string{}}
+	}
+	service := &Service{cfg: cfg, Workspaces: cfg.Workspaces, events: newEventHub(), drafts: cfg.Drafts}
 	if cfg.Runner != nil {
 		cfg.Runner.SetOnStatus(func(sessionID string, running bool) {
 			service.Emit(EventSessionStatus, sessionID, running)
@@ -134,6 +157,16 @@ func (s *Service) Open(ctx context.Context, endpoint string, payload []byte, upl
 	return nil, s.unimplemented(endpoint)
 }
 
+// Unary answers one Gateway unary method for the HTTP bridge. Stream methods
+// belong to the WebSocket carrier and are rejected here.
+func (s *Service) Unary(endpoint string, args json.RawMessage) (any, error) {
+	switch endpoint {
+	case "session/follow", "session/control", "workspace/follow", EndpointEvents:
+		return nil, fail(CodeUnimplemented, fmt.Sprintf("%s streams over /api/remote.mux", endpoint))
+	}
+	return s.unary(endpoint, args)
+}
+
 // unary answers one Gateway unary method.
 func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 	switch endpoint {
@@ -165,6 +198,18 @@ func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 		return s.initializeDefaultWorkspace(args)
 	case "workspace/create":
 		return s.createWorkspace(args)
+	case "session/status":
+		return s.status(args)
+	case "session/refreshModelCatalog":
+		return s.refreshModelCatalog(args)
+	case "session/selectDefaultModel":
+		return s.selectDefaultModel(args)
+	case "session/inject":
+		return s.inject(args)
+	case "session/edit":
+		return s.edit(args)
+	case "session/fork":
+		return s.fork(args)
 	}
 	return nil, s.unimplemented(endpoint)
 }
@@ -306,6 +351,9 @@ func (s *Service) resolveAddress(value address) (*session.Session, error) {
 }
 
 func (s *Service) openSession(id string) (*session.Session, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, fail(CodeBadRequest, "sessionId is required")
+	}
 	opened, err := s.cfg.Store.Open(id)
 	if err != nil {
 		if errors.Is(err, session.ErrNotFound) {

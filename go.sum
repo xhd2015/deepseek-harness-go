@@ -1,5 +1,7 @@
 github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
+github.com/klauspost/compress v1.18.4 h1:RPhnKRAQ4Fh8zU2FY/6ZFDwTVTxgJ/EMydqSTzE9a2c=
+github.com/klauspost/compress v1.18.4/go.mod h1:R0h/fSBs8DE4ENlcrlib3PsXS61voFxhIs2DeRhCvJ4=
 github.com/xhd2015/dot-pkgs/go-pkgs v0.0.193 h1:c0cp+DIKvIuF3htuc6PM8MDyyYt/t4nKBsMewcWB0HA=
 github.com/xhd2015/dot-pkgs/go-pkgs v0.0.193/go.mod h1:iS6oppnsvK1YjNTQGJpQwllDW5uMPP2I571DK/3hBHM=
 github.com/xhd2015/less-flags v1.0.6 h1:AhOBXezoNPpvjT+CtKCpWDDwjY+2LxY4DwBNR5xXDs8=

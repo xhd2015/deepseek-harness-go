@@ -82,7 +82,7 @@ func alignToTurnStart(events []Event, index int) int {
 }
 
 func isMessageEvent(event Event) bool {
-	if event.SurfaceOp == "" {
+	if event.SurfaceOp == nil {
 		return false
 	}
 	switch event.Type {

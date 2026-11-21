@@ -26,6 +26,7 @@ import (
 	"github.com/xhd2015/deepseek-harness-go/server"
 	"github.com/xhd2015/deepseek-harness-go/session"
 	"github.com/xhd2015/deepseek-harness-go/version"
+	"github.com/xhd2015/deepseek-harness-go/workspace"
 )
 
 // Defaults for the serve command.
@@ -37,6 +38,7 @@ const (
 
 // Environment variables read by the command line.
 const (
+	EnvHome         = "DSH_GO_HOME"
 	EnvSessionsRoot = "DSH_GO_SESSIONS_ROOT"
 	EnvToken        = "DSH_GO_TOKEN"
 	EnvProvider     = "DSH_GO_PROVIDER"
@@ -52,23 +54,35 @@ const (
 
 // Options configures one dsh-go process.
 type Options struct {
-	Host         string
-	Port         int
-	SessionsRoot string
-	AssetsDir    string
-	Token        string
-	ProxyTo      string
-	Provider     string
-	Model        string
-	Reasoning    string
-	Protocol     string
+	Host string
+	Port int
+	// DataDir holds sessions, attachments, storages and the listen record. It
+	// defaults to ~/.dsh-go and is deliberately distinct from DSH's ~/.dsh.
+	DataDir string
+	// Compression is the session artifact encoding: zstd, none, or empty to
+	// detect an existing root and otherwise write zstd.
+	Compression string
+	// ListenRecord asks the server to write a listen record under the data dir.
+	ListenRecord bool
+	// PublishListenTo additionally writes the record into this directory, so
+	// agent-pro and dsh web open can find this process without DSH_HOME.
+	PublishListenTo string
+	SessionsRoot    string
+	AssetsDir       string
+	Token           string
+	ProxyTo         string
+	Provider        string
+	Model           string
+	Reasoning       string
+	Protocol        string
 	// Models points at the cordis patch that describes every route llm-proxy
 	// serves. An empty value uses ~/.dsh/profiles/web/cordis.patch.yml.
 	Models     string
 	BaseURL    string
 	APIKey     string
 	DefaultCwd string
-	Home       string
+	// UserHome is the operating-system home directory.
+	UserHome string
 	// ToolRoot is the fallback workspace for tool calls whose session has no
 	// recorded cwd, and the directory validated at startup. It is not a read
 	// jail. Empty uses the process working directory.
@@ -80,6 +94,9 @@ type Options struct {
 	// routeExplicit is set when the provider/model came from a flag or the
 	// environment rather than from the built-in single-route default.
 	routeExplicit bool
+	// sharedHarnessHome records that the data directory is DSH's own home, so
+	// startup can warn about two hosts sharing one state tree.
+	sharedHarnessHome bool
 }
 
 // NewServer builds a server and its cleanup function.
@@ -87,8 +104,21 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 	if err := opts.applyDefaults(); err != nil {
 		return nil, nil, err
 	}
-	store, err := session.NewStore(opts.SessionsRoot)
+	store, err := session.NewStoreWithConfig(session.Config{
+		Root:        opts.SessionsRoot,
+		Compression: session.Compression(opts.Compression),
+	})
 	if err != nil {
+		return nil, nil, err
+	}
+	workspaces, err := workspace.Open(filepath.Join(opts.DataDir, "storages"))
+	if err != nil {
+		_ = store.Close()
+		return nil, nil, err
+	}
+	drafts, err := api.OpenDrafts(filepath.Join(opts.DataDir, "storages"))
+	if err != nil {
+		_ = store.Close()
 		return nil, nil, err
 	}
 	captured, err := assets.Load(opts.AssetsDir)
@@ -109,7 +139,8 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		Model:           catalog.Default.Model,
 		ReasoningEffort: catalog.Default.ReasoningEffort,
 		ToolRoot:        opts.ToolRoot,
-		DSHHome:         filepath.Join(opts.Home, ".dsh-go"),
+		DSHHome:         opts.DataDir,
+		ModelsPath:      opts.Models,
 		Logf:            logf,
 	})
 	service := api.New(api.Config{
@@ -118,9 +149,25 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		Catalog:     catalog,
 		DefaultCwd:  opts.DefaultCwd,
 		AgentPreset: DefaultPreset,
-		HomeDir:     opts.Home,
-		DSHHome:     filepath.Join(opts.Home, ".dsh-go"),
-		Logf:        logf,
+		HomeDir:     opts.UserHome,
+		DataDir:     opts.DataDir,
+		DSHHome:     opts.DataDir,
+		Workspaces:  workspaces,
+		Drafts:      drafts,
+		ReloadModels: func(path string) (*modelconfig.Catalog, map[string]*llm.Client, error) {
+			return buildModelSurface(Options{
+				DataDir:   opts.DataDir,
+				UserHome:  opts.UserHome,
+				Models:    path,
+				Provider:  opts.Provider,
+				Model:     opts.Model,
+				Reasoning: opts.Reasoning,
+				Protocol:  opts.Protocol,
+				BaseURL:   opts.BaseURL,
+				APIKey:    opts.APIKey,
+			}, logf)
+		},
+		Logf: logf,
 	})
 	srv, err := server.New(server.Config{
 		Addr:    net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port)),
@@ -128,7 +175,11 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		Assets:  captured,
 		ProxyTo: opts.ProxyTo,
 		Token:   opts.Token,
-		Logf:    logf,
+		// The listen record is how external clients find this process.
+		ListenRecord:    opts.ListenRecord,
+		ListenRecordDir: opts.DataDir,
+		PublishListenTo: opts.PublishListenTo,
+		Logf:            logf,
 	})
 	if err != nil {
 		_ = store.Close()
@@ -136,13 +187,17 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 	}
 
 	logf("models: %d routes, default %s/%s", catalog.RouteCount(), catalog.Default.Provider, catalog.Default.Model)
-	logf("sessions in %s", opts.SessionsRoot)
+	logf("data dir %s", opts.DataDir)
+	if opts.sharedHarnessHome {
+		logf("warning: sharing a harness home with a running DSH host; the write lease is required and this root's encoding must match")
+	}
+	logf("sessions in %s (%s)", opts.SessionsRoot, store.Compression())
 	if opts.AssetsDir != "" {
 		logf("assets from %s", opts.AssetsDir)
 	} else if captured.Available() {
 		logf("assets embedded (%d responses)", len(captured.Manifest().Entries))
 	} else {
-		logf("no web assets staged: run `go run ./script/sync-assets` then rebuild")
+		logf("warning: no frontend embedded; run `go run ./script/build` to stage it")
 	}
 
 	cleanup := func() {
@@ -161,6 +216,7 @@ func (opts *Options) applyEnv() {
 			*target = os.Getenv(name)
 		}
 	}
+	set(&opts.DataDir, EnvHome)
 	set(&opts.SessionsRoot, EnvSessionsRoot)
 	set(&opts.Token, EnvToken)
 	set(&opts.Provider, EnvProvider)
@@ -195,21 +251,35 @@ func (opts *Options) applyDefaults() error {
 	if opts.Port < 0 || opts.Port > 65535 {
 		return fmt.Errorf("port %d is out of range", opts.Port)
 	}
-	if opts.Home == "" {
+	if opts.UserHome == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return fmt.Errorf("locate home directory: %w", err)
 		}
-		opts.Home = home
+		opts.UserHome = home
+	}
+	if opts.DataDir == "" {
+		opts.DataDir = filepath.Join(opts.UserHome, ".dsh-go")
 	}
 	if opts.SessionsRoot == "" {
-		opts.SessionsRoot = filepath.Join(opts.Home, ".dsh-go", "sessions")
+		opts.SessionsRoot = filepath.Join(opts.DataDir, "sessions")
+	}
+	if sameDir(opts.DataDir, filepath.Join(opts.UserHome, ".dsh")) {
+		opts.sharedHarnessHome = true
+	}
+	if opts.Compression == "auto" {
+		opts.Compression = ""
+	}
+	switch session.Compression(opts.Compression) {
+	case "", session.CompressionZstd, session.CompressionNone:
+	default:
+		return fmt.Errorf("--session-compression must be zstd, none, or auto")
 	}
 	if opts.DefaultCwd == "" {
 		if cwd, err := os.Getwd(); err == nil {
 			opts.DefaultCwd = cwd
 		} else {
-			opts.DefaultCwd = opts.Home
+			opts.DefaultCwd = opts.UserHome
 		}
 	}
 	if opts.Provider == "" {
@@ -224,6 +294,7 @@ func (opts *Options) applyDefaults() error {
 	if opts.Protocol == "" {
 		opts.Protocol = llm.ProtocolOpenAIChat
 	}
+	opts.ListenRecord = true
 	if opts.Stdout == nil {
 		opts.Stdout = os.Stdout
 	}
@@ -247,7 +318,18 @@ Serve the DeepSeek Harness web client backed by a Go session store.
 Options:
   -p, --port PORT          listen port (default 3070)
   -H, --host HOST          listen host (default 127.0.0.1)
-      --sessions-root DIR  session storage (default ~/.dsh-go/sessions)
+      --home DIR           data directory for sessions, attachments, storages
+                           and the listen record (default $DSH_GO_HOME or
+                           ~/.dsh-go; DSH_HOME is deliberately not inherited)
+      --data-dir DIR       alias for --home
+      --sessions-root DIR  override only the session storage directory
+                           (default <home>/sessions)
+      --session-compression zstd|none|auto
+                           session artifact encoding (default auto: keep an
+                           existing root's encoding, otherwise zstd)
+      --publish-listen-to DIR
+                           also write DIR/web-listen.json so a client that
+                           resolves DSH_HOME=D data dir finds this process
       --assets-dir DIR     serve a captured frontend from DIR instead of the
                            embedded copy
       --token TOKEN        require a token; open /?token=TOKEN once to set the
@@ -260,7 +342,8 @@ Options:
       --protocol NAME      model wire protocol: openai-chat or
                            anthropic-messages (default openai-chat)
       --models FILE        cordis patch that defines every model route
-                           (default ~/.dsh/profiles/web/cordis.patch.yml)
+                           (default <home>/profiles/web/cordis.patch.yml,
+                           falling back to ~/.dsh/profiles/web/cordis.patch.yml)
       --base-url URL       model endpoint base URL
                            (default https://api.deepseek.com/v1)
       --tool-root DIR      fallback workspace when a session has no cwd
@@ -271,6 +354,7 @@ Options:
 Environment:
   DEEPSEEK_API_KEY         API key for the model provider
   DEEPSEEK_BASE_URL        alternative OpenAI-compatible base URL
+  DSH_GO_HOME              data directory (default ~/.dsh-go)
   DSH_GO_SESSIONS_ROOT     session storage directory
   DSH_GO_TOKEN             auth token
   DSH_GO_PROVIDER          provider label
@@ -292,7 +376,10 @@ func Main(args []string) {
 	var showVersion bool
 	remain, err := lessflags.Int("-p,--port", &opts.Port).
 		String("-H,--host", &opts.Host).
+		String("--home,--data-dir", &opts.DataDir).
 		String("--sessions-root", &opts.SessionsRoot).
+		String("--session-compression", &opts.Compression).
+		String("--publish-listen-to", &opts.PublishListenTo).
 		String("--assets-dir", &opts.AssetsDir).
 		String("--token", &opts.Token).
 		String("--proxy-to", &opts.ProxyTo).
@@ -382,7 +469,16 @@ func buildModelSurface(opts Options, logf func(format string, args ...any)) (*mo
 		return catalog, clients, nil
 	}
 	if models == "" {
-		models = filepath.Join(opts.Home, ".dsh", "profiles", "web", "cordis.patch.yml")
+		models = filepath.Join(opts.DataDir, "profiles", "web", "cordis.patch.yml")
+		if _, statErr := os.Stat(models); statErr != nil {
+			// The model catalog predates the split data directory; keep reading
+			// the existing Harness profile rather than silently dropping it.
+			legacy := filepath.Join(opts.UserHome, ".dsh", "profiles", "web", "cordis.patch.yml")
+			if _, legacyErr := os.Stat(legacy); legacyErr == nil {
+				logf("models: %s not found, reading %s", models, legacy)
+				models = legacy
+			}
+		}
 	}
 	catalog, err := modelconfig.LoadPatch(models)
 	if err != nil {
@@ -449,3 +545,16 @@ func buildModelSurface(opts Options, logf func(format string, args ...any)) (*mo
 }
 
 func modelRouteKey(provider, model string) string { return provider + "\x00" + model }
+
+// sameDir compares two directory paths after cleaning.
+func sameDir(a, b string) bool {
+	left, err := filepath.Abs(a)
+	if err != nil {
+		return false
+	}
+	right, err := filepath.Abs(b)
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
+}

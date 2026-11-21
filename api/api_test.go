@@ -257,14 +257,15 @@ func TestSessionCreateWithIDRetriesBlankSession(t *testing.T) {
 	}
 	decode(t, f.invoke(t, "session/create", map[string]any{"request": request}).mustSucceed(t), &first)
 	decode(t, f.invoke(t, "session/create", map[string]any{"request": request}).mustSucceed(t), &second)
-	if first.SessionID != "api-retry-id" || second.SessionID != first.SessionID {
+	// The backend canonicalizes a bare id into a Harness-shaped one.
+	if first.SessionID != "session-api-retry-id" || second.SessionID != first.SessionID {
 		t.Fatalf("first = %+v, second = %+v", first, second)
 	}
 	entries, err := f.store.List()
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Header.ID != "api-retry-id" {
+	if len(entries) != 1 || entries[0].Header.ID != "session-api-retry-id" {
 		t.Fatalf("sessions = %+v", entries)
 	}
 	if entries[0].LastSeq >= 0 {
@@ -287,7 +288,8 @@ func TestUnaryFailuresAreSingleItems(t *testing.T) {
 
 func TestUnimplementedAndMalformedRequests(t *testing.T) {
 	f := newFixture(t)
-	f.invoke(t, "session/fork", map[string]any{"request": map[string]any{}}).mustFail(t, CodeUnimplemented)
+	f.invoke(t, "session/fork", map[string]any{"request": map[string]any{}}).mustFail(t, CodeBadRequest)
+	f.invoke(t, "session/search", map[string]any{"request": map[string]any{"query": "x"}}).mustFail(t, CodeUnimplemented)
 
 	// The typed client always nests args under the single parameter name.
 	stream, err := f.service.Open(context.Background(), EndpointInvoke, []byte(`{"args":{"endpoint":"session/page","payload":{"args":{"address":{"sessionId":"x"}}}}}`), nil)

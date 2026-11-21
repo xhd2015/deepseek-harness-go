@@ -39,8 +39,11 @@ type transcriptMessage struct {
 }
 
 // history rebuilds the model-facing conversation from durable surface events.
+// message/edit records are folded before the model sees the transcript, so an
+// edit changes what the agent reads without changing any message's identity.
 func (r *Runner) history(sess *session.Session) []llm.Message {
 	messages := []llm.Message{{Role: "system", Content: r.systemPrompt()}}
+	sources := []int64{-1}
 	for _, event := range sess.Events() {
 		switch event.Type {
 		case session.EventUserMessage:
@@ -59,6 +62,7 @@ func (r *Runner) history(sess *session.Session) []llm.Message {
 				text.WriteString(block.Text)
 			}
 			messages = append(messages, llm.Message{Role: "user", Content: text.String()})
+			sources = append(sources, event.Seq)
 		case session.EventAssistantMessage:
 			var stored struct {
 				Message transcriptMessage `json:"message"`
@@ -74,6 +78,7 @@ func (r *Runner) history(sess *session.Session) []llm.Message {
 			}
 			restoreSignatures(&message)
 			messages = append(messages, message)
+			sources = append(sources, event.Seq)
 		case session.EventToolResult:
 			var stored struct {
 				Message transcriptMessage `json:"message"`
@@ -92,9 +97,64 @@ func (r *Runner) history(sess *session.Session) []llm.Message {
 				ToolCallID: callID,
 				IsError:    stored.Message.IsError,
 			})
+			sources = append(sources, event.Seq)
 		}
 	}
+	messages = applyMessageEdits(messages, sources, sess.Events())
 	return limitHistory(messages, r.cfg.HistoryLimit)
+}
+
+// applyMessageEdits applies every committed message/edit record. A target that
+// is no longer a current node is skipped: a later compaction can shadow the
+// node an older edit names, and refusing would make a valid log unreadable.
+func applyMessageEdits(messages []llm.Message, sources []int64, events []session.Event) []llm.Message {
+	type edit struct {
+		Seq     int64  `json:"seq"`
+		Text    string `json:"text"`
+		Deleted bool   `json:"deleted"`
+	}
+	deleted := map[int]bool{}
+	for _, event := range events {
+		if event.Type != session.EventMessageEdit {
+			continue
+		}
+		var data struct {
+			Edits []edit `json:"edits"`
+		}
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			continue
+		}
+		for _, change := range data.Edits {
+			index := -1
+			for position, seq := range sources {
+				if seq == change.Seq {
+					index = position
+					break
+				}
+			}
+			if index < 0 || index == 0 {
+				continue
+			}
+			if change.Deleted {
+				deleted[index] = true
+				continue
+			}
+			messages[index].Content = change.Text
+			messages[index].Blocks = nil
+			messages[index].Images = nil
+		}
+	}
+	if len(deleted) == 0 {
+		return messages
+	}
+	out := make([]llm.Message, 0, len(messages)-len(deleted))
+	for index, message := range messages {
+		if deleted[index] {
+			continue
+		}
+		out = append(out, message)
+	}
+	return out
 }
 
 // toolImages reloads inline image blocks referenced by a stored tool result.

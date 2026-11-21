@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -46,8 +47,17 @@ type Config struct {
 	Assets *assets.Assets
 	// ProxyTo forwards every non-API request to a running UI, for development.
 	ProxyTo string
-	// Token enables cookie authentication; empty disables it.
+	// Token enables cookie and bearer authentication; empty disables it.
 	Token string
+	// ListenRecordDir publishes <dir>/web-listen.json so an external client can
+	// find this process. Empty writes nothing.
+	ListenRecordDir string
+	// ListenRecord also publishes the record when set; ListenRecordDir decides
+	// where. Kept as one switch so --home alone is enough.
+	ListenRecord bool
+	// PublishListenTo mirrors the record into a second directory, for clients
+	// that resolve discovery through DSH_HOME.
+	PublishListenTo string
 	// Logf receives diagnostics; nil discards them.
 	Logf func(format string, args ...any)
 }
@@ -109,6 +119,24 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	s.addr = listener.Addr().String()
 	s.logf("listening on http://%s/", s.addr)
+	if s.cfg.ListenRecord && s.cfg.ListenRecordDir != "" {
+		record := ListenRecord{PID: os.Getpid(), Origin: "http://" + s.addr, Token: s.cfg.Token}
+		path, err := writeListenRecord(s.cfg.ListenRecordDir, record)
+		if err != nil {
+			s.logf("listen record: %v", err)
+		} else if path != "" {
+			s.logf("listen record %s", path)
+			defer clearListenRecord(s.cfg.ListenRecordDir, record.PID)
+		}
+		if s.cfg.PublishListenTo != "" {
+			if mirror, err := writeListenRecord(s.cfg.PublishListenTo, record); err != nil {
+				s.logf("listen record mirror: %v", err)
+			} else {
+				s.logf("listen record mirror %s", mirror)
+				defer clearListenRecord(s.cfg.PublishListenTo, record.PID)
+			}
+		}
+	}
 	if s.cfg.Token != "" {
 		s.logf("authentication enabled: open http://%s/?%s=<token>", s.addr, TokenQuery)
 	}
@@ -143,6 +171,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	// Only a POST to /api/<method> is a Remote call. Everything else under
+	// /api/ is a static or Host-provided route: the SharedWorker bundle, the
+	// export and present routes, and file uploads are all GETs, and proxying
+	// them to a running UI is what keeps the captured frontend working.
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, APIPrefix) && r.URL.Path != MuxPath:
+		s.serveRPC(w, r)
 	case r.URL.Path == HealthPath:
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
@@ -210,6 +244,15 @@ func (s *Server) authorized(r *http.Request) bool {
 	}
 	if provided := r.URL.Query().Get(TokenQuery); provided != "" && s.matches(provided) {
 		return true
+	}
+	// Out-of-process clients carry the launch token as a bearer credential.
+	if header := r.Header.Get("Authorization"); header != "" {
+		const prefix = "Bearer "
+		if len(header) > len(prefix) && strings.EqualFold(header[:len(prefix)], prefix) {
+			if s.matches(strings.TrimSpace(header[len(prefix):])) {
+				return true
+			}
+		}
 	}
 	cookie, err := r.Cookie(CookieName)
 	if err != nil {

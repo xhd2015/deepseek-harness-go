@@ -33,14 +33,15 @@ func Baseline(header Header, events []Event) ProjectionBaseline {
 	// The projection face always exists: a Session with no selection yet still
 	// reports the fold's initial view. The web client treats a missing face as
 	// "projections are still loading" and never enables the composer.
-	var next any
+	var next, lastUsed any
 	if entry.ModelSelection != nil {
 		next = entry.ModelSelection
 	}
+	if entry.LastUsed != nil {
+		lastUsed = entry.LastUsed
+	}
 	values["modelSelection"] = map[string]any{
-		// dsh-go records selections but not the request header that consumes
-		// one, so no selection has become "last used" yet.
-		"lastUsed": nil,
+		"lastUsed": lastUsed,
 		"next":     next,
 	}
 	values["todos"] = todosProjection(events)
@@ -60,12 +61,15 @@ func SummaryProjections(entry ListEntry) map[string]any {
 		"blank":        entry.Blank,
 		"lastPromptAt": lastPromptAt,
 	}
-	var next any
+	var next, lastUsed any
 	if entry.ModelSelection != nil {
 		next = entry.ModelSelection
 	}
+	if entry.LastUsed != nil {
+		lastUsed = entry.LastUsed
+	}
 	values["modelSelection"] = map[string]any{
-		"lastUsed": nil,
+		"lastUsed": lastUsed,
 		"next":     next,
 	}
 	return map[string]any{

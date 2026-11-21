@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/xhd2015/deepseek-harness-go/agent"
+	"github.com/xhd2015/deepseek-harness-go/modelconfig"
 	"github.com/xhd2015/deepseek-harness-go/mux"
 	"github.com/xhd2015/deepseek-harness-go/session"
 )
@@ -49,10 +50,11 @@ func summaryOf(entry session.ListEntry) map[string]any {
 
 // createRequest is SessionCreateRequest.
 type createRequest struct {
-	WorkspaceID string `json:"workspaceId"`
-	Cwd         string `json:"cwd"`
-	SessionID   string `json:"sessionId"`
-	AgentPreset string `json:"agentPreset"`
+	WorkspaceID    string                  `json:"workspaceId"`
+	Cwd            string                  `json:"cwd"`
+	SessionID      string                  `json:"sessionId"`
+	AgentPreset    string                  `json:"agentPreset"`
+	ModelSelection *session.ModelSelection `json:"modelSelection"`
 }
 
 // create answers session/create.
@@ -83,6 +85,17 @@ func (s *Service) create(args json.RawMessage) (any, error) {
 	if preset == "" {
 		preset = s.cfg.AgentPreset
 	}
+	// An explicit initial selection is validated before anything exists, so a
+	// bad route never leaves a half-created session behind.
+	if request.ModelSelection != nil {
+		if _, err := s.catalog().Resolve(modelconfig.Selection{
+			Provider:        request.ModelSelection.Provider,
+			Model:           request.ModelSelection.Model,
+			ReasoningEffort: request.ModelSelection.ReasoningEffort,
+		}); err != nil {
+			return nil, fail(CodeBadRequest, err.Error())
+		}
+	}
 	var (
 		opened *session.Session
 		err    error
@@ -98,7 +111,15 @@ func (s *Service) create(args json.RawMessage) (any, error) {
 	if _, created := s.Workspaces.Add(cwd); !created {
 		s.Workspaces.Touch(cwd)
 	}
-	return map[string]any{"sessionId": opened.ID(), "agentPreset": preset}, nil
+	accepted, err := s.applyInitialSelection(opened, request.ModelSelection)
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]any{"sessionId": opened.ID(), "agentPreset": preset}
+	if accepted != nil {
+		result["modelSelection"] = accepted
+	}
+	return result, nil
 }
 
 // rename answers session/rename.
@@ -337,9 +358,17 @@ func (s *Service) attachment(args json.RawMessage) (any, error) {
 	var request struct {
 		SessionID    string `json:"sessionId"`
 		AttachmentID string `json:"attachmentId"`
+		// Attachment is the typed reference the Harness client sends; the flat
+		// attachmentId stays for older callers.
+		Attachment *struct {
+			AttachmentID string `json:"attachmentId"`
+		} `json:"attachment"`
 	}
 	if err := decodeRequest(args, &request); err != nil {
 		return nil, fail(CodeBadRequest, err.Error())
+	}
+	if request.Attachment != nil && strings.TrimSpace(request.Attachment.AttachmentID) != "" {
+		request.AttachmentID = request.Attachment.AttachmentID
 	}
 	if strings.TrimSpace(request.AttachmentID) == "" {
 		return nil, fail(CodeBadRequest, "attachmentId is required")

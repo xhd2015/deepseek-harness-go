@@ -174,7 +174,6 @@ func (opts *Options) ApplyDefaults() error {
 	if opts.Protocol == "" {
 		opts.Protocol = llm.ProtocolOpenAIChat
 	}
-	opts.ListenRecord = true
 	if opts.Stdout == nil {
 		opts.Stdout = os.Stdout
 	}

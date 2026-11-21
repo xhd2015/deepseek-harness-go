@@ -49,6 +49,9 @@ type Options = host.Options
 // NewServer builds the CLI's server: the host backend plus the embedded
 // frontend. A host that serves its own page calls host.NewServer directly.
 func NewServer(opts Options) (*server.Server, func(), error) {
+	// The CLI always publishes discovery: a `dsh-go serve` on this machine is
+	// something another process should be able to find.
+	opts.ListenRecord = true
 	captured, err := assets.Load(opts.AssetsDir)
 	if err != nil {
 		return nil, nil, err

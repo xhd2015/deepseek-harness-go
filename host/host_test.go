@@ -98,7 +98,10 @@ func TestListenRecordIsPublishedForAHost(t *testing.T) {
 		UserHome: dir,
 		DataDir:  dataDir,
 		Addr:     "127.0.0.1:0",
-		Stderr:   io.Discard,
+		// A host that binds a port publishes discovery the same way the CLI
+		// does; the record is opt-in because a mounted backend has no port.
+		ListenRecord: true,
+		Stderr:       io.Discard,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)

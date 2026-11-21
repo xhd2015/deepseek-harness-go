@@ -13,3 +13,8 @@
 
 .DS_Store
 *.test
+/external
+
+# Per-checkout frontend source. Committed as .deepseek-harness.example.json;
+# this copy names one machine's checkout and must not be shared.
+/.deepseek-harness.json

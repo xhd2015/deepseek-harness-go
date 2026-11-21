@@ -9,10 +9,11 @@ the Node host needs hundreds of megabytes and a full workspace install, which
 is too much for a 1 GB Raspberry Pi that also runs other services. `dsh-go` is
 one static binary of a few tens of MiB with the frontend embedded.
 
-The frontend is **not** forked. Assets are captured from a running DeepSeek
-Harness web UI and served byte-for-byte, so the browser runs the same React
+The frontend is **not** forked. `go run ./script/build` resolves a DeepSeek
+Harness checkout, builds it if needed, serves it once, captures every response
+the page needs, and embeds that capture, so the browser runs the same React
 client, the same shared multiplex worker, and the same session chat page. Only
-the backend is new.
+the backend is new, and `serve` needs no Node process and no proxy.
 
 ## Status
 
@@ -30,11 +31,22 @@ tools return the same trust notice, source list and truncation contracts.
 Oversized grep results are spilled under the session directory so the model can
 page through them.
 
+Sessions are stored in the DeepSeek Harness v4 layout, byte-compatible with the
+Node host: checksummed Zstandard frames by default, `session-<uuid>` identities,
+a `session.lock` write lease, and the same header and event envelopes. A root
+written here lists and reads on a real DSH host, and a real DSH root lists and
+reads here. Out-of-process clients drive the backend over `POST /api/<method>`
+with the same request envelopes the page uses, and discovery goes through
+`<data-dir>/web-listen.json`. The full SDK surface needed by the `agent-pro`
+client is implemented, including `session/inject`, `session/edit`,
+`session/fork`, `session/status`, `session/refreshModelCatalog` and
+`session/selectDefaultModel`.
+
 Deliberately out of scope for now: subagents, the terminal and PTY tools, queue
-steering, federation, and the Node host's zstd compression and cross-process
-log locking. Background jobs are process-local and do not survive a restart.
-Foreground `bash` calls do not yet promote to a background job at their
-timeout; the command is stopped and the timeout marker is returned.
+steering, federation, compaction, and scheduled tasks. Background jobs are
+process-local and do not survive a restart. Foreground `bash` calls do not yet
+promote to a background job at their timeout; the command is stopped and the
+timeout marker is returned.
 
 ## Tools and permissions
 
@@ -58,7 +70,7 @@ confine what a `bash` command itself writes with its own tools.
 
 Like DSH, `bash` children do not inherit credential-shaped variables
 (`KEY`, `PASSWORD`, `SECRET`, `TOKEN`, case-insensitive) or ambient `DSH_*`
-variables. They receive the managed facts `DSH_HOME` (`~/.dsh-go`),
+variables. They receive the managed facts `DSH_HOME` (the data directory),
 `DSH_SHELL=1`, and `DSH_SESSION_ID`.
 
 `bash` with `run_in_background` registers the process in the in-memory job
@@ -93,15 +105,72 @@ body and final text.
 ## Quick start
 
 ```sh
-go run ./script/sync-assets     # capture the frontend from a running DSH web UI
-go run ./script/build           # build dist/dsh-go with the capture embedded
+go run ./script/build           # stage the frontend, then build dist/dsh-go
 export DEEPSEEK_API_KEY=sk-...
 ./dist/dsh-go serve             # http://127.0.0.1:3070/
 ```
 
-`go run ./script/install` does the build and copies the binary to
-`~/.local/bin/dsh-go`. A bare `dsh-go` is the same as `dsh-go serve`; `dsh-go
-version` prints the build version.
+`go run ./script/build` needs Node and pnpm only when it has to build the
+DeepSeek Harness checkout; a checkout that is already built is served once and
+captured. Nothing has to be running on port 3080, and the resulting binary
+serves the real UI including the SharedWorker bundle, so `--proxy-to` is never
+needed in production. `go run ./script/install` does the same and then installs
+the binary. A bare `dsh-go` is the same as `dsh-go serve`; `dsh-go version`
+prints the build version.
+
+### Frontend source
+
+The frontend is not an npm dependency: it is built from a git checkout. The
+first match wins, and the chosen path is printed before the build.
+
+1. `DSH_ROOT` — a local checkout (must exist).
+2. `.deepseek-harness.json` `local` — a path relative to the file.
+3. `.deepseek-harness.json` `repo` + `branch` — cloned into
+   `~/.cache/dsh-go/deepseek-harness/<repo>/<branch>` and refreshed with a
+   shallow fetch on each build.
+4. The official `https://github.com/deepseek-ai/deepseek-harness` `main`, in the
+   same cache.
+
+`.deepseek-harness.json` is gitignored; `.deepseek-harness.example.json` is
+committed. Copy it to opt in:
+
+```sh
+cp .deepseek-harness.example.json .deepseek-harness.json
+```
+
+A local checkout:
+
+```json
+{ "local": "../deepseek-harness" }
+```
+
+A fork branch:
+
+```json
+{ "repo": "https://github.com/xhd2015/deepseek-harness", "branch": "feat/x" }
+```
+
+If this tree is a linked git worktree without its own file, the main
+checkout's copy is used and the build says so; `local` paths resolve relative to
+the file that was found.
+
+Useful flags:
+
+```sh
+go run ./script/build --force-frontend   # rebuild and recapture
+go run ./script/build --source http://127.0.0.1:3080 --token T
+                                         # capture from a running server instead
+go run ./script/build --allow-missing-assets
+                                         # backend-only build, with a warning
+```
+
+`go run ./script/install` stages the frontend the same way (`--force-bundle`,
+`--skip-frontend`, `--source`, `--allow-missing-assets`), then installs through
+`gotool/localbin/install`: an existing `dsh-go` on `PATH` is overwritten,
+otherwise `~/.local/bin/dsh-go` is used; other existing copies under
+`~/.local/bin`, `$GOBIN` and `$GOPATH/bin` are refreshed, `~/.local/bin` is
+added to `PATH`, and the binary is ad-hoc codesigned on macOS. A failed
+codesign is a `warning:`, not an error.
 
 `script/install` honors `INSTALL_TO_DIR`, `INSTALL_GOOS`, and `INSTALL_GOARCH`,
 so a Linux/arm64 build for a remote host needs no extra tooling:
@@ -135,7 +204,9 @@ go run ./script/dev
 `script/dev` builds and hot-reloads the Go backend on port **3070** and proxies
 everything except `/api/remote.mux` to the frontend upstream. That means the
 browser loads real assets from `:3080` while all protocol traffic is answered
-by Go. Override the upstream with `DSH_GO_DEV_FRONTEND`.
+by Go. Override the upstream with `DSH_GO_DEV_FRONTEND`. `--proxy-to` exists for
+this loop only: a production `serve` answers the page from its embedded
+capture.
 
 Hot reload uses [Air](https://github.com/air-verse/air), so `air` and a Go
 toolchain matching `go.mod` must be on `PATH`. `--no-use-air` runs the backend
@@ -145,27 +216,45 @@ in-process instead (no rebuild on save):
 go run ./script/dev --no-use-air --no-open
 ```
 
-`go run ./script/sync-assets` re-captures the frontend into `assets/dist` when
-the upstream revision changes. The capture is gitignored; `assets/dist/.gitkeep`
-keeps the embed directive valid on a fresh clone, and the server shows a setup
-page instead of the UI until a capture exists.
+`go run ./script/build` re-captures the frontend into `assets/dist` when a
+build runs; it skips the work while a complete capture is staged and
+`--force-frontend` overrides that. `go run ./script/sync-assets` is the manual
+form, for capturing from a server you are already running:
+
+```sh
+go run ./script/sync-assets                 # http://127.0.0.1:3080
+go run ./script/sync-assets --source URL --token T
+```
+
+The capture is written atomically, so a failed capture leaves the previous one
+intact, and it is rejected unless the source served
+`/api/remote.shared-mux-worker.js`, because a page captured without it would
+never connect. `assets/dist` is gitignored; `assets/dist/.gitkeep` keeps the
+embed directive valid on a fresh clone, and the server warns when no frontend is
+embedded.
 
 ## Layout
 
 ```
 cmd/dsh-go          thin main
 run                 CLI, configuration, wiring
-server              HTTP: auth, assets, WebSocket mux, dev proxy
+server              HTTP: auth, assets, WebSocket mux, /api RPC bridge,
+                    listen record, dev proxy
 mux                 multiplexed WebSocket transport (streams, heartbeats)
 api                 browser-facing endpoints: sessions, workspace, models, drafts
 agent               one model turn written as DSH session events
 llm                 model client: OpenAI chat or Anthropic Messages
-session             DSH v4 JSONL event log: store, paging, projections
-workspace           in-memory workspace registry
+session             DSH v4 event log: paths, zstd frames, generations,
+                    write lease, store, paging, projections
+workspace           durable workspace unit (<home>/storages/workspace.json)
 assets              embedded frontend capture and URI lookup
 build               shared build pipeline and version stamping
 script/             sync-assets, dev, build, install
+dshsource           DeepSeek Harness checkout lookup, build and one-shot serve
+frontend            frontend capture and staging into assets/dist
 testdata/           two real captured session logs used by tests
+compat/             separate module: agent-pro reads our logs, its client
+                    drives our HTTP bridge
 ```
 
 ## Browser protocol
@@ -187,36 +276,59 @@ are serialized by parameter name, which is why session methods expect
 Implemented endpoints:
 
 - `session/list`, `create`, `rename`, `page`, `follow`, `control`, `prompt`,
-  `cancel`, `projections`, `modelCatalog`, `selectModel`, `getDraft`, `setDraft`,
-  `attachment`
+  `cancel`, `projections`, `modelCatalog`, `selectModel`, `refreshModelCatalog`,
+  `selectDefaultModel`, `status`, `inject`, `edit`, `fork`, `getDraft`,
+  `setDraft`, `attachment`
 - `workspace/follow`, `initializeDefault`, `create`
 - `$events`, `$invoke`
+
+Unary calls are also served as plain HTTP, for clients that are not a browser
+page. Only a **POST** under `/api/` is a Remote call; a GET there is a static or
+Host-provided route (`/api/remote.shared-mux-worker.js`, the export and present
+routes, file uploads), so it is served from the capture or forwarded by
+`--proxy-to` like any other page asset. The call itself is `POST /api/<method>`
+with `{"type":"client-request","rpcId","method","payload":{"args":{...}}}` and an
+`{"type":"server-response","rpcId","result":{"ok",value|error}}` reply. Requests
+must be `application/json`; `method` must match the path; the launch token is
+accepted as `Authorization: Bearer`. Streams stay on `/api/remote.mux`.
 
 Anything else returns a structured `unimplemented` error and ends the stream;
 the UI stays usable because those calls are optional for the chat page.
 
 ## Data
 
-Sessions live under `~/.dsh-go/sessions` unless `--sessions-root` or
-`DSH_GO_SESSIONS_ROOT` says otherwise, in the DSH v4 layout:
+Everything lives under one **data directory**, `~/.dsh-go` by default. It is
+deliberately separate from the DeepSeek Harness home (`~/.dsh`): `DSH_HOME` is
+never inherited, and pointing this backend at a Harness home requires saying so
+with `--home ~/.dsh`. The layout inside it is identical to the Node host's:
 
 ```
-<root>/<cwd-slug>/session-<uuid>/session.v4.jsonl
+<home>/sessions/<project-key>/session-<uuid>/session.v4.jsonl.zstd
+<home>/sessions/<project-key>/session-<uuid>/session.lock
+<home>/attachments/v1/objects/<sha256-prefix>/<sha256>
+<home>/storages/session_composer_drafts/drafts/<session-id>.json
+<home>/storages/workspace.json
+<home>/web-listen.json
 ```
 
-The first line is the session header, every later line is one event. Unlike the
-Node host the log is plain JSONL, not zstd, and there is no lock file; one
-process owns a session. Attachments are stored once under
-`~/.dsh-go/attachments/v1/objects/<sha256-prefix>/<sha256>` and referenced from
-session events by `sha256:<hex>` ids. The event vocabulary and wire shapes match DSH v4 so
-the existing frontend can project and render them. Session ids are bare UUIDs
-inside the header; the directory adds the `session-` prefix.
+The first Zstandard frame is exactly the session header line; every later frame
+is one append batch of event lines, checksummed the way DSH writes them. A root
+that already holds plain `session.v4.jsonl` artifacts keeps that encoding, and
+one root never mixes the two. `session.lock` is a kernel write lease held for
+the life of the writing handle, so a second writer is refused with
+`session/already-owned` instead of tearing the log; readers never take it.
 
-Workspaces are in memory only. They are keyed by absolute path (`ws-<hash>`),
-created by `workspace/create` or the default first-use flow, and their session
-membership is computed from each session's `cwd` when the follow stream emits a
-baseline. Restarting loses the registry but not the sessions; on the next start
-the workspace is recreated as sessions are attached.
+`project-key` follows DSH's rule: separators collapse to one `-`, unsafe code
+units escape as `~XXXX`, leading dashes are stripped, and the slug is bounded.
+A session id always starts with `session-`; a log written before that rule keeps
+its bare id on read and is repaired on the next write. Artifacts, records and
+the lease file are `0600`, directories `0700`.
+
+Workspaces are durable in `<home>/storages/workspace.json`, the same versioned
+unit the Host writes (name `workspace`, version 2, opaque UUID ids), and each
+session's membership is recomputed from its `cwd`. Composer drafts are durable
+in `storages/session_composer_drafts`, so text saved without submitting survives
+a restart and is readable by another Harness process.
 
 ## Configuration
 
@@ -226,19 +338,23 @@ Flags (also see `dsh-go serve -h`):
 | --- | --- | --- |
 | `-p, --port` | `3070` | listen port |
 | `-H, --host` | `127.0.0.1` | listen host |
-| `--sessions-root` | `~/.dsh-go/sessions` | where logs are written |
+| `--home`, `--data-dir` | `$DSH_GO_HOME` or `~/.dsh-go` | data directory |
+| `--sessions-root` | `<home>/sessions` | override only the session root |
+| `--session-compression` | `auto` | `zstd`, `none`, or keep the existing root |
+| `--publish-listen-to` | none | also write `<dir>/web-listen.json` |
 | `--assets-dir` | embedded capture | serve a capture from disk |
 | `--token` | none | require a token; `/?token=…` sets the cookie |
-| `--proxy-to` | none | forward non-API requests to a web UI |
+| `--proxy-to` | none | development only: forward non-API requests to a live UI |
 | `--provider` / `--model` / `--reasoning` | `deepseek` / `deepseek-chat` / unset | model selection |
 | `--protocol` | `openai-chat` | wire format: `openai-chat` or `anthropic-messages` |
 | `--base-url` | `https://api.deepseek.com/v1` | model endpoint base URL |
 | `--tool-root` | process cwd | fallback workspace and startup validation root for tools |
 
 Environment: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`,
-`DEEPSEEK_SEARCH_BASE_URL`, `DSH_GO_SESSIONS_ROOT`, `DSH_GO_TOKEN`,
-`DSH_GO_PROVIDER`, `DSH_GO_MODEL`, `DSH_GO_REASONING_EFFORT`,
-`DSH_GO_PROTOCOL`, `DSH_GO_ASSETS_DIR`, `DSH_GO_TOOL_ROOT`.
+`DEEPSEEK_SEARCH_BASE_URL`, `DSH_GO_HOME`, `DSH_GO_SESSIONS_ROOT`,
+`DSH_GO_TOKEN`, `DSH_GO_PROVIDER`, `DSH_GO_MODEL`,
+`DSH_GO_REASONING_EFFORT`, `DSH_GO_PROTOCOL`, `DSH_GO_ASSETS_DIR`,
+`DSH_GO_TOOL_ROOT`. `DSH_HOME` is not read.
 
 By default the server binds loopback and has no authentication. `--token`
 mints a signed cookie from `GET /?token=…`; WebSocket clients may also pass
@@ -255,3 +371,14 @@ Every package has tests. They use an in-process fake model server and a
 temporary session store, so no API key or network access is needed.
 `testdata/sessions` contains two logs captured from a real DSH host to keep the
 reader honest about the real event vocabulary.
+
+`compat/` is a separate module that imports `agent-pro` and proves the contract
+from the other side: agent-pro's reader lists and inspects sessions this backend
+writes, and agent-pro's own web client creates, drafts, selects a model on and
+queries a session served by this backend.
+
+```sh
+go test ./...
+go test -race ./...
+(cd compat && go test ./...)
+```

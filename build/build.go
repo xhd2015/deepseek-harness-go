@@ -3,7 +3,6 @@
 package build
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +10,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/xhd2015/deepseek-harness-go/frontend"
 )
 
 // ModulePath is this module.
@@ -84,7 +85,7 @@ func Build(opts Options) (Result, error) {
 	}
 	responses, captured := AssetCount(root)
 	if !captured && !opts.AllowMissingAssets {
-		return Result{}, fmt.Errorf("no frontend captured in %s: run `go run ./script/sync-assets` first, "+
+		return Result{}, fmt.Errorf("no frontend captured in %s: run `go run ./script/build` (it stages the frontend), "+
 			"or pass --allow-missing-assets for a backend-only build", filepath.Join(root, "assets", "dist"))
 	}
 	goBinary, err := goCommand(opts.GoBinary)
@@ -196,24 +197,11 @@ func DetectVersion(root string) string {
 	return "0.1.0-dev"
 }
 
-type manifestEntries struct {
-	Entries map[string]json.RawMessage `json:"entries"`
-}
-
-// AssetCount reports how many captured responses are staged.
+// AssetCount reports how many captured responses are staged. A capture only
+// counts when it holds the SharedWorker route, because a page served without it
+// never connects.
 func AssetCount(root string) (int, bool) {
-	raw, err := os.ReadFile(filepath.Join(root, "assets", "dist", "manifest.json"))
-	if err != nil {
-		return 0, false
-	}
-	var manifest manifestEntries
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return 0, false
-	}
-	if len(manifest.Entries) == 0 {
-		return 0, false
-	}
-	return len(manifest.Entries), true
+	return frontend.Count(filepath.Join(root, "assets", "dist"))
 }
 
 // GoCommand exposes the resolved go binary for scripts that shell out.

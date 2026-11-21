@@ -50,6 +50,7 @@ func main() {
 			filepath.Join(root, "llm"),
 			filepath.Join(root, "modelconfig"),
 			filepath.Join(root, "session"),
+			filepath.Join(root, "workspace"),
 			filepath.Join(root, "assets"),
 			filepath.Join(root, "version"),
 			filepath.Join(root, "script", "dev"),

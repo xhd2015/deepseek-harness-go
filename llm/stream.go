@@ -443,7 +443,7 @@ type wireChatChunk struct {
 }
 
 func decodeChatStream(ctx context.Context, body io.Reader, emit func(Chunk) error) (bool, error) {
-	state := &chatStreamState{emit: emit}
+	state := newChatStreamState(emit)
 	err := readSSE(ctx, body, state.event)
 	if err != nil {
 		return false, err
@@ -472,12 +472,35 @@ type chatStreamState struct {
 	stopEmitted  bool
 }
 
-func (s *chatStreamState) start(typ string) error {
+// newChatStreamState returns a decoder with its block tables ready. Every
+// constructor must go through it: an event that opens no text or reasoning
+// block reaches toolBlock first, and writing to a nil map there aborts the
+// process instead of failing one turn.
+func newChatStreamState(emit func(Chunk) error) *chatStreamState {
+	return &chatStreamState{
+		emit:      emit,
+		blocks:    map[int]*ContentBlock{},
+		tools:     map[int]*ContentBlock{},
+		toolIndex: map[int]int{},
+	}
+}
+
+// init makes the block tables usable on a zero value, so a state built by
+// literal (or by a future constructor) still cannot panic on a tool call.
+func (s *chatStreamState) init() {
 	if s.blocks == nil {
 		s.blocks = map[int]*ContentBlock{}
-		s.toolIndex = map[int]int{}
+	}
+	if s.tools == nil {
 		s.tools = map[int]*ContentBlock{}
 	}
+	if s.toolIndex == nil {
+		s.toolIndex = map[int]int{}
+	}
+}
+
+func (s *chatStreamState) start(typ string) error {
+	s.init()
 	index := s.nextIndex
 	s.nextIndex++
 	s.current = index
@@ -501,6 +524,7 @@ func (s *chatStreamState) close() error {
 }
 
 func (s *chatStreamState) toolBlock(wire int, delta *wireChatToolCall) (int, error) {
+	s.init()
 	if index, ok := s.toolIndex[wire]; ok {
 		if s.current != index {
 			if err := s.close(); err != nil {
@@ -680,7 +704,7 @@ func decodeChatJSONAnswer(ctx context.Context, body io.Reader, emit func(Chunk) 
 	if len(parsed.Choices) == 0 {
 		return &Failure{Code: "EMPTY_RESPONSE", Message: "model returned no content"}
 	}
-	state := &chatStreamState{emit: emit}
+	state := newChatStreamState(emit)
 	state.model = parsed.Model
 	for _, choice := range parsed.Choices {
 		payload := map[string]any{}

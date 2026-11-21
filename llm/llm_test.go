@@ -441,3 +441,135 @@ func TestReplayIsOmittedWhenEntriesDoNotAlign(t *testing.T) {
 		t.Fatalf("completion = %+v", completion)
 	}
 }
+
+// TestChatStreamToolCallsWithoutLeadingText is the regression for the decoder
+// crash that killed the process on the second model step: an openai-chat stream
+// whose first delta is a tool call opens no text or reasoning block, so the
+// block tables were still nil when the tool call was recorded.
+func TestChatStreamToolCallsWithoutLeadingText(t *testing.T) {
+	server := sseServer(t, []string{
+		// The very first delta is a tool call: no text, no reasoning.
+		`{"model":"fake-tools","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"write","arguments":"{\"file_path\":\"probe.txt\","}}]}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"content\":\"probe\"}"}}]}}]}`,
+		// A second call in the same response, opened after the first.
+		`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call-2","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}`,
+		`{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}`,
+		`[DONE]`,
+	})
+	client := New(Config{BaseURL: server.URL + "/v1", APIKey: "secret", Model: "fake-tools"})
+	completion, err := client.Complete(context.Background(), Request{
+		Model:    "fake-tools",
+		Messages: []Message{{Role: "user", Content: "write then list"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if completion.Text != "" {
+		t.Fatalf("text = %q, want none", completion.Text)
+	}
+	if len(completion.ToolCalls) != 2 {
+		t.Fatalf("tool calls = %+v", completion.ToolCalls)
+	}
+	first, second := completion.ToolCalls[0], completion.ToolCalls[1]
+	if first.ID != "call-1" || first.Name != "write" {
+		t.Fatalf("first call = %+v", first)
+	}
+	if first.Arguments != `{"file_path":"probe.txt","content":"probe"}` {
+		t.Fatalf("first arguments = %q", first.Arguments)
+	}
+	if second.ID != "call-2" || second.Name != "bash" || second.Arguments != `{"command":"ls"}` {
+		t.Fatalf("second call = %+v", second)
+	}
+	if completion.FinishReason != "tool-calls" {
+		t.Fatalf("finish = %q", completion.FinishReason)
+	}
+	if len(completion.Blocks) != 2 || completion.Blocks[0].Type != "tool-call" || completion.Blocks[1].Type != "tool-call" {
+		t.Fatalf("blocks = %+v", completion.Blocks)
+	}
+}
+
+// TestChatStreamSecondStepToolCalls covers the reported sequence: one response
+// with text and a tool call, then a follow-up response that carries only tool
+// calls. The second step must decode with the same state rules as the first.
+func TestChatStreamSecondStepToolCalls(t *testing.T) {
+	steps := [][]string{
+		{
+			`{"choices":[{"delta":{"content":"Writing the probe."}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"write","arguments":"{\"file_path\":\"probe.txt\"}"}}]}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+		{
+			// No prose this time: the model goes straight to tools.
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-2","type":"function","function":{"name":"edit","arguments":"{\"file_path\":"}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"probe.txt\"}"}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call-3","type":"function","function":{"name":"bash","arguments":"{\"command\":\"cat probe.txt\"}"}}]}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		},
+	}
+	var step atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		index := int(step.Add(1)) - 1
+		if index >= len(steps) {
+			t.Fatalf("unexpected request %d", index+1)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, chunk := range steps[index] {
+			if _, err := w.Write([]byte("data: " + chunk + "\n\n")); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := New(Config{BaseURL: server.URL + "/v1", APIKey: "secret", Model: "fake-tools"})
+
+	first, err := client.Complete(context.Background(), Request{
+		Model:    "fake-tools",
+		Messages: []Message{{Role: "user", Content: "write the probe"}},
+	})
+	if err != nil {
+		t.Fatalf("step 1: %v", err)
+	}
+	if first.Text != "Writing the probe." || len(first.ToolCalls) != 1 || first.ToolCalls[0].Name != "write" {
+		t.Fatalf("step 1 = %+v", first)
+	}
+
+	second, err := client.Complete(context.Background(), Request{
+		Model: "fake-tools",
+		Messages: []Message{
+			{Role: "user", Content: "write the probe"},
+			{Role: "assistant", Content: "Writing the probe."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("step 2: %v", err)
+	}
+	if second.Text != "" {
+		t.Fatalf("step 2 text = %q", second.Text)
+	}
+	if len(second.ToolCalls) != 2 {
+		t.Fatalf("step 2 calls = %+v", second.ToolCalls)
+	}
+	if second.ToolCalls[0].Arguments != `{"file_path":"probe.txt"}` {
+		t.Fatalf("edit arguments = %q", second.ToolCalls[0].Arguments)
+	}
+	if second.ToolCalls[1].Name != "bash" {
+		t.Fatalf("second call = %+v", second.ToolCalls[1])
+	}
+}
+
+// sseServer streams the given data lines as an event stream.
+func sseServer(t *testing.T, chunks []string) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, chunk := range chunks {
+			if _, err := w.Write([]byte("data: " + chunk + "\n\n")); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}

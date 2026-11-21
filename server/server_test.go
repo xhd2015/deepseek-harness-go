@@ -83,7 +83,7 @@ func newTestServer(t *testing.T, cfg Config) *httptest.Server {
 
 func TestHealthAndCapturedFrontend(t *testing.T) {
 	capture := testCapture(t)
-	ts := newTestServer(t, Config{Assets: capture})
+	ts := newTestServer(t, Config{Frontend: capture})
 
 	health := get(t, ts.URL+HealthPath)
 	if health.StatusCode != http.StatusOK {
@@ -121,7 +121,7 @@ func TestHealthAndCapturedFrontend(t *testing.T) {
 }
 
 func TestAssetLookupKeepsPluginQueryURIs(t *testing.T) {
-	ts := newTestServer(t, Config{Assets: testCapture(t)})
+	ts := newTestServer(t, Config{Frontend: testCapture(t)})
 	uri := "/plugins/??@scope/plugin/client.js&rev=abc"
 	resp := get(t, ts.URL+uri)
 	if resp.StatusCode != http.StatusOK {
@@ -143,7 +143,7 @@ func TestSetupPageWithoutCapture(t *testing.T) {
 	if empty.Available() {
 		t.Fatal("empty capture reports itself available")
 	}
-	ts := newTestServer(t, Config{Assets: empty})
+	ts := newTestServer(t, Config{Frontend: empty})
 	resp := get(t, ts.URL+"/")
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d", resp.StatusCode)
@@ -159,7 +159,7 @@ func TestSetupPageWithoutCapture(t *testing.T) {
 }
 
 func TestTokenAuthGuardsTheMux(t *testing.T) {
-	ts := newTestServer(t, Config{Assets: testCapture(t), Token: "s3cret"})
+	ts := newTestServer(t, Config{Frontend: testCapture(t), Token: "s3cret"})
 
 	if resp := get(t, ts.URL+"/"); resp.StatusCode != http.StatusOK {
 		t.Fatalf("frontend must stay readable: %d", resp.StatusCode)

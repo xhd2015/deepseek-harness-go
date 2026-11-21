@@ -197,7 +197,7 @@ func TestRPCBearsTheLaunchToken(t *testing.T) {
 // removes it again.
 func TestListenRecordRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	record := ListenRecord{PID: 4242, Origin: "http://127.0.0.1:3070", Token: "t"}
+	record := ListenRecord{PID: 4242, Origin: "http://127.0.0.1:8300", Token: "t"}
 	path, err := writeListenRecord(dir, record)
 	if err != nil {
 		t.Fatalf("writeListenRecord: %v", err)
@@ -256,7 +256,7 @@ func TestWorkerBundleIsNotAnRPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assets.Load: %v", err)
 	}
-	ts := newTestServer(t, Config{Assets: captured})
+	ts := newTestServer(t, Config{Frontend: captured})
 
 	resp := get(t, ts.URL+WorkerPath)
 	if resp.StatusCode != http.StatusOK {

@@ -22,7 +22,7 @@ func TestDataDirIsDistinctFromHarnessHome(t *testing.T) {
 	t.Setenv(EnvSessionsRoot, "")
 
 	opts := Options{UserHome: userHome}
-	if err := opts.applyDefaults(); err != nil {
+	if err := opts.ApplyDefaults(); err != nil {
 		t.Fatalf("applyDefaults: %v", err)
 	}
 	want := filepath.Join(userHome, ".dsh-go")
@@ -50,7 +50,7 @@ func TestDataDirPrecedence(t *testing.T) {
 	t.Setenv(EnvSessionsRoot, "")
 
 	fromEnv := Options{UserHome: userHome}
-	if err := fromEnv.applyDefaults(); err != nil {
+	if err := fromEnv.ApplyDefaults(); err != nil {
 		t.Fatalf("applyDefaults: %v", err)
 	}
 	if fromEnv.DataDir != filepath.Join(userHome, "from-env") {
@@ -58,7 +58,7 @@ func TestDataDirPrecedence(t *testing.T) {
 	}
 
 	explicit := Options{UserHome: userHome, DataDir: filepath.Join(userHome, "from-flag")}
-	if err := explicit.applyDefaults(); err != nil {
+	if err := explicit.ApplyDefaults(); err != nil {
 		t.Fatalf("applyDefaults: %v", err)
 	}
 	if explicit.DataDir != filepath.Join(userHome, "from-flag") {
@@ -74,7 +74,7 @@ func TestDataDirPrecedence(t *testing.T) {
 		DataDir:      filepath.Join(userHome, "data"),
 		SessionsRoot: filepath.Join(userHome, "elsewhere"),
 	}
-	if err := overridden.applyDefaults(); err != nil {
+	if err := overridden.ApplyDefaults(); err != nil {
 		t.Fatalf("applyDefaults: %v", err)
 	}
 	if overridden.SessionsRoot != filepath.Join(userHome, "elsewhere") {
@@ -88,12 +88,12 @@ func TestSessionCompressionFlag(t *testing.T) {
 	userHome := t.TempDir()
 	for _, value := range []string{"", "auto", "zstd", "none"} {
 		opts := Options{UserHome: userHome, DataDir: filepath.Join(userHome, "d"), Compression: value}
-		if err := opts.applyDefaults(); err != nil {
+		if err := opts.ApplyDefaults(); err != nil {
 			t.Fatalf("applyDefaults(%q): %v", value, err)
 		}
 	}
 	opts := Options{UserHome: userHome, DataDir: filepath.Join(userHome, "d"), Compression: "gzip"}
-	if err := opts.applyDefaults(); err == nil {
+	if err := opts.ApplyDefaults(); err == nil {
 		t.Fatal("an unknown compression was accepted")
 	}
 }

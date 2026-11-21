@@ -102,6 +102,14 @@ func (a *Assets) Available() bool {
 	return len(a.manifest.Entries) > 0 && a.manifest.Entries[a.indexURI()].File != ""
 }
 
+// Responses is how many captured responses the frontend holds.
+func (a *Assets) Responses() int {
+	if a == nil {
+		return 0
+	}
+	return len(a.manifest.Entries)
+}
+
 // Manifest returns the capture index.
 func (a *Assets) Manifest() Manifest {
 	if a == nil {

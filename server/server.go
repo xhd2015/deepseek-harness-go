@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/xhd2015/deepseek-harness-go/api"
-	"github.com/xhd2015/deepseek-harness-go/assets"
 	"github.com/xhd2015/deepseek-harness-go/mux"
 )
+
+// DefaultAddr is the loopback listen address used when none is given.
+const DefaultAddr = "127.0.0.1:8300"
 
 // Wire paths shared with the web client.
 const (
@@ -37,14 +39,24 @@ const (
 	CookieName = "dsh_go_token"
 )
 
+// Frontend is the captured web client this server answers page requests from.
+type Frontend interface {
+	// Lookup resolves one request URI to its captured body.
+	Lookup(uri string) (body []byte, contentType string, ok bool)
+	// Responses is how many captured responses it holds.
+	Responses() int
+}
+
 // Config configures the HTTP server.
 type Config struct {
-	// Addr is the listen address, for example 127.0.0.1:3070.
+	// Addr is the listen address, for example 127.0.0.1:8300.
 	Addr string
 	// Service answers Remote streams; it is required.
 	Service *api.Service
-	// Assets is the captured frontend; nil or empty serves a setup page.
-	Assets *assets.Assets
+	// Frontend serves the captured web client. Nil, or a frontend with no
+	// responses, serves a setup page instead. It is an interface so a host can
+	// mount this backend without linking the capture into its own binary.
+	Frontend Frontend
 	// ProxyTo forwards every non-API request to a running UI, for development.
 	ProxyTo string
 	// Token enables cookie and bearer authentication; empty disables it.
@@ -78,7 +90,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, errors.New("server: a stream service is required")
 	}
 	if cfg.Addr == "" {
-		cfg.Addr = "127.0.0.1:3070"
+		cfg.Addr = DefaultAddr
 	}
 	s := &Server{cfg: cfg}
 	if cfg.ProxyTo != "" {
@@ -273,9 +285,13 @@ func cookieValue(token string) string {
 
 // serveAsset answers one captured response.
 func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request) {
-	body, contentType, ok := s.cfg.Assets.Lookup(r.URL.RequestURI())
+	if s.cfg.Frontend == nil {
+		s.serveSetup(w)
+		return
+	}
+	body, contentType, ok := s.cfg.Frontend.Lookup(r.URL.RequestURI())
 	if !ok && r.URL.Path == "/index.html" {
-		body, contentType, ok = s.cfg.Assets.Lookup("/")
+		body, contentType, ok = s.cfg.Frontend.Lookup("/")
 	}
 	if !ok {
 		if r.URL.Path == "/" {

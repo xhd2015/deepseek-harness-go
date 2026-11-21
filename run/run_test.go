@@ -18,7 +18,7 @@ func TestApplyDefaultsReadsEnvironment(t *testing.T) {
 	t.Setenv(EnvAPIKey, "env-key")
 
 	var opts Options
-	if err := opts.applyDefaults(); err != nil {
+	if err := opts.ApplyDefaults(); err != nil {
 		t.Fatalf("apply defaults: %v", err)
 	}
 	if opts.Host != DefaultHost || opts.Port != DefaultPort {
@@ -52,7 +52,7 @@ func TestApplyDefaultsPrefersExplicitOptions(t *testing.T) {
 		Model:        "flag-model",
 		APIKey:       "flag-key",
 	}
-	if err := opts.applyDefaults(); err != nil {
+	if err := opts.ApplyDefaults(); err != nil {
 		t.Fatalf("apply defaults: %v", err)
 	}
 	if opts.SessionsRoot != "/tmp/dsh-go-flag-sessions" {

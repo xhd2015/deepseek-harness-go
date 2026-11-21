@@ -17,7 +17,7 @@ const ListenFileName = "web-listen.json"
 type ListenRecord struct {
 	// PID is the serving process; a record whose process is gone is stale.
 	PID int `json:"pid"`
-	// Origin is the canonical loopback origin, for example http://127.0.0.1:3070.
+	// Origin is the canonical loopback origin, for example http://127.0.0.1:8300.
 	Origin string `json:"origin"`
 	// Token is the process launch token accepted as Authorization: Bearer. It
 	// is absent when authentication is disabled.

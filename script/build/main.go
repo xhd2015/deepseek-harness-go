@@ -127,6 +127,6 @@ func main() {
 		fmt.Printf("embedded %d frontend responses\n", result.Responses)
 	} else {
 		fmt.Println("warning: built without a captured frontend")
-		fmt.Printf("note: with no frontend, serve needs --proxy-to; open http://127.0.0.1:3070/ after `%s serve`\n", build.BinaryName)
+		fmt.Printf("note: with no frontend, serve needs --proxy-to; open http://127.0.0.1:8300/ after `%s serve`\n", build.BinaryName)
 	}
 }

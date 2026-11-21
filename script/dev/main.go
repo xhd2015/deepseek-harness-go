@@ -1,4 +1,4 @@
-// Command dev runs the development server: the Go backend on port 3070 with
+// Command dev runs the development server: the Go backend on port 8300 with
 // every non-API request proxied to a running DeepSeek Harness web UI, so the
 // Go implementation can be developed against the real frontend.
 //

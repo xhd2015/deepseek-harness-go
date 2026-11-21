@@ -182,7 +182,7 @@ func main() {
 		fmt.Printf("note: %s is not on PATH; add its directory to run `%s` from any directory\n",
 			installed.Primary, build.BinaryName)
 	}
-	fmt.Printf("run `%s version`, then `%s serve` and open http://127.0.0.1:3070/\n", build.BinaryName, build.BinaryName)
+	fmt.Printf("run `%s version`, then `%s serve` and open http://127.0.0.1:8300/\n", build.BinaryName, build.BinaryName)
 }
 
 // buildOutput is where the intermediate binary is written.

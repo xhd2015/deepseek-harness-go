@@ -107,7 +107,7 @@ body and final text.
 ```sh
 go run ./script/build           # stage the frontend, then build dist/dsh-go
 export DEEPSEEK_API_KEY=sk-...
-./dist/dsh-go serve             # http://127.0.0.1:3070/
+./dist/dsh-go serve             # http://127.0.0.1:8300/
 ```
 
 `go run ./script/build` needs Node and pnpm only when it has to build the
@@ -180,6 +180,30 @@ INSTALL_GOOS=linux INSTALL_GOARCH=arm64 INSTALL_TO_DIR=/tmp/dsh-go-arm64 \
   go run ./script/install
 ```
 
+### Embedding the backend
+
+`host` wires the same backend `dsh-go serve` runs — session store, workspaces,
+drafts, model catalog, turn runner, HTTP surface — without a frontend and
+without a command line. Another Go program can mount it:
+
+```go
+handler, cleanup, err := host.Mount(host.Options{
+    DataDir: "/path/to/data",   // default ~/.dsh-go
+    Token:   "secret",          // empty disables auth
+    Stderr:  os.Stderr,
+})
+defer cleanup()
+```
+
+`host.Mount` never loads the embedded capture, and `host` does not depend on
+the `assets` package at all, so the importing binary does not grow by the
+18 MiB frontend. The page then answers 503 with a setup hint; the `/api`
+surface is complete. `run.NewServer` is the CLI's own entry: it loads the
+capture and delegates to `host`.
+
+The default port is **8300** — distinct from the DeepSeek Harness Web UI on
+3080, so both can run at once.
+
 When only a local `llm-proxy` is reachable and it exposes Anthropic Messages:
 
 ```sh
@@ -201,7 +225,7 @@ useful reference backend. Point the dev server at it:
 go run ./script/dev
 ```
 
-`script/dev` builds and hot-reloads the Go backend on port **3070** and proxies
+`script/dev` builds and hot-reloads the Go backend on port **8300** and proxies
 everything except `/api/remote.mux` to the frontend upstream. That means the
 browser loads real assets from `:3080` while all protocol traffic is answered
 by Go. Override the upstream with `DSH_GO_DEV_FRONTEND`. `--proxy-to` exists for
@@ -237,7 +261,9 @@ embedded.
 
 ```
 cmd/dsh-go          thin main
-run                 CLI, configuration, wiring
+run                 CLI: flags, embedded frontend, serve
+host                the backend as a library (no frontend, no CLI);
+                    what eluc mounts
 server              HTTP: auth, assets, WebSocket mux, /api RPC bridge,
                     listen record, dev proxy
 mux                 multiplexed WebSocket transport (streams, heartbeats)
@@ -336,7 +362,7 @@ Flags (also see `dsh-go serve -h`):
 
 | flag | default | meaning |
 | --- | --- | --- |
-| `-p, --port` | `3070` | listen port |
+| `-p, --port` | `8300` | listen port |
 | `-H, --host` | `127.0.0.1` | listen host |
 | `--home`, `--data-dir` | `$DSH_GO_HOME` or `~/.dsh-go` | data directory |
 | `--sessions-root` | `<home>/sessions` | override only the session root |

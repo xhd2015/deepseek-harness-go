@@ -191,6 +191,11 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 			},
 		},
 		{
+			Name:        askUserQuestionToolName,
+			Description: askUserQuestionDescription,
+			Parameters:  askUserQuestionParametersWithWait(),
+		},
+		{
 			Name:        "read",
 			Description: "Read a UTF-8 text file and return line-numbered content.",
 			Parameters: map[string]any{
@@ -390,6 +395,8 @@ func (e *ToolExecutor) ExecuteOutcome(ctx context.Context, inv ToolInvocation) T
 	case "grep":
 		text, failed := e.grep(ctx, inv, args)
 		return ToolOutcome{Text: text, IsError: failed}
+	case askUserQuestionToolName:
+		return e.askUserQuestion(ctx, inv, args)
 	case "todo_write":
 		return e.todoWrite(inv, args)
 	case "job_output":

@@ -210,6 +210,8 @@ func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 		return s.edit(args)
 	case "session/fork":
 		return s.fork(args)
+	case "userQuestions/answer":
+		return s.answerQuestion(args)
 	}
 	return nil, s.unimplemented(endpoint)
 }

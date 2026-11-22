@@ -39,9 +39,14 @@ type Config struct {
 
 // ToolDef is one model-facing tool definition.
 type ToolDef struct {
-	Name        string
-	Description string
-	Parameters  map[string]any
+	// The JSON names are part of the durable record, not a style choice: the
+	// session log stores the tool schemas a request actually used, and the page
+	// reads them back to decide which calls it can answer. A field that
+	// serializes as "Parameters" is invisible to a reader looking for
+	// "parameters", so a question would look like it has no wait window.
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
 }
 
 // ToolCall is one model-requested tool invocation. Arguments is the raw JSON

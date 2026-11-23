@@ -177,10 +177,15 @@ func (s *Service) archiveSession(args json.RawMessage) (any, error) {
 	if s.archived == nil {
 		return nil, fail(CodeUnimplemented, "archive needs a data directory")
 	}
-	// An id already in the set resolves without checking anything: DSH returns
+	// An id already in the set resolves without an activity check: DSH returns
 	// before asking, so a session that went active after being archived cannot make
-	// a retry fail.
+	// a retry fail. It still has to be a real session, though — the set outlives the
+	// transcript, and a row whose log was deleted is not something a retry can
+	// confirm. Reporting the set without it keeps the answer honest.
 	if s.archived.contains(sessionID) {
+		if !s.sessionOnDisk(sessionID) {
+			s.archived.prune(sessionID)
+		}
 		return map[string]any{"archivedSessionIds": s.archived.snapshot()}, nil
 	}
 	if _, err := s.openSession(sessionID); err != nil {
@@ -252,4 +257,36 @@ func archiveOrNil(dataDir string) *archiveStore {
 		return &archiveStore{}
 	}
 	return store
+}
+
+// prune drops one id without reading it as a failure.
+//
+// A session's transcript can be deleted while its id is still archived: the set is
+// registry state and outlives the log. Removing the entry is the correction, and it
+// has to be quiet — the caller asked about a session, not about the set's health.
+func (a *archiveStore) prune(sessionID string) {
+	// A prune that cannot be written still takes effect in memory for this process:
+	// the entry is wrong either way, and leaving it visible because the disk refused
+	// a rewrite would keep showing a row nobody can open.
+	_ = a.remove(sessionID)
+}
+
+// sessionOnDisk reports whether a session still has a transcript.
+//
+// The store's own Open is not enough: it hands back a handle it already has in
+// memory, so a log deleted out from under the process still opens. The set outlives
+// the log, and an entry naming a session nobody can open is a row no surface can
+// act on, so this reads the directories instead of the cache.
+func (s *Service) sessionOnDisk(sessionID string) bool {
+	entries, err := s.cfg.Store.List()
+	if err != nil {
+		// A listing that cannot be read is not evidence the session is gone.
+		return true
+	}
+	for _, entry := range entries {
+		if entry.Header.ID == sessionID {
+			return true
+		}
+	}
+	return false
 }

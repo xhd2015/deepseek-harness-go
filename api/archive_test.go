@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -204,3 +205,52 @@ func (s *Service) mustUnary(t *testing.T, endpoint string, args map[string]any) 
 }
 
 var _ = strings.TrimSpace
+
+// TestArchivingADeletedSessionPrunesTheStaleId is the phantom row this fixes.
+//
+// The archive set outlives the transcript, so a session whose log was deleted left
+// an id nothing could resolve: /api/orchestrator/approvals-style listings showed a
+// row that no API would accept. Archiving it again is the retry that must correct
+// the set rather than replay it.
+func TestArchivingADeletedSessionPrunesTheStaleId(t *testing.T) {
+	f := newFixture(t)
+	opened := f.createSession(t)
+	id := opened.ID()
+	f.invoke(t, "workspace/archiveSession", map[string]any{
+		"request": map[string]any{"sessionId": id},
+	}).mustSucceed(t)
+	if !f.service.archived.contains(id) {
+		t.Fatal("the archive never landed")
+	}
+	// Deleting the transcript is what a reader does when they clean up by hand. The
+	// log lives under a project directory, so the removal has to find it there.
+	removed := false
+	projects, err := os.ReadDir(filepath.Join(f.root, "sessions"))
+	if err != nil {
+		t.Fatalf("read sessions root: %v", err)
+	}
+	for _, project := range projects {
+		dir := filepath.Join(f.root, "sessions", project.Name(), id)
+		if _, statErr := os.Stat(dir); statErr == nil {
+			if err := os.RemoveAll(dir); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+			removed = true
+		}
+	}
+	if !removed {
+		t.Fatalf("the transcript for %s was not on disk to begin with", id)
+	}
+	var value struct {
+		ArchivedSessionIDs []string `json:"archivedSessionIds"`
+	}
+	decode(t, f.invoke(t, "workspace/archiveSession", map[string]any{
+		"request": map[string]any{"sessionId": id},
+	}).mustSucceed(t), &value)
+	if containsString(value.ArchivedSessionIDs, id) {
+		t.Fatalf("a deleted session is still listed as archived: %v", value.ArchivedSessionIDs)
+	}
+	if f.service.archived.contains(id) {
+		t.Fatal("the stale id survived the retry")
+	}
+}

@@ -122,7 +122,29 @@ func (s *Service) PublishApproval(request agent.ApprovalRequest) {
 		s.logf("publish approval: %v", err)
 		return
 	}
-	s.approvalFrames.track(eventID, request.ID)
+	s.approvalFrames.track(eventID, request.ID, request.Session)
+}
+
+// WithdrawApproval tells the page the question is over.
+//
+// Every exit from the wait passes here: a timeout, a cancellation, or a decision
+// delivered by another answerer. A page that learned only about questions would
+// keep offering a button for an answer already on disk.
+func (s *Service) WithdrawApproval(request agent.ApprovalRequest, outcome agent.ApprovalOutcome) {
+	s.approvalFrames.mu.Lock()
+	eventID := ""
+	for frame, entry := range s.approvalFrames.byEvent {
+		if entry.approvalID == request.ID {
+			eventID = frame
+			break
+		}
+	}
+	s.approvalFrames.mu.Unlock()
+	if eventID == "" {
+		return
+	}
+	s.approvalFrames.take(eventID)
+	s.withdrawWaterfall(eventID)
 }
 
 // settleApprovalFrame delivers a page's answer to the approval it asked about.

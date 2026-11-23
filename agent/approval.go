@@ -169,6 +169,12 @@ func (r *Runner) askApproval(sess *session.Session, toolName, callID, reason str
 			case <-time.After(r.approvalWindow()):
 				outcome = ApprovalUnavailable
 			}
+			// Whatever ends the wait — a timeout, a cancellation, another answerer —
+			// the question is over. Withdrawing it is what keeps a consumer from
+			// offering a button for a decision that can no longer take effect.
+			if r.withdrawApproval != nil {
+				r.withdrawApproval(request, outcome)
+			}
 		}
 	}
 	if outcome == "" {
@@ -259,5 +265,17 @@ func (r *Runner) approvalWindow() time.Duration {
 func (r *Runner) SetApprovalWindow(window time.Duration) {
 	r.mu.Lock()
 	r.approvalWait = window
+	r.mu.Unlock()
+}
+
+// SetApprovalWithdrawer installs the callback that tells the page a question is
+// over, whatever ended it.
+//
+// A consumer that only learns about questions would keep a card on screen after the
+// window expired, and the user would answer a question whose answer is already
+// recorded — the button would appear to do nothing.
+func (r *Runner) SetApprovalWithdrawer(withdraw func(ApprovalRequest, ApprovalOutcome)) {
+	r.mu.Lock()
+	r.withdrawApproval = withdraw
 	r.mu.Unlock()
 }

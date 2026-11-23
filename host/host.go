@@ -249,6 +249,14 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		// from question to decision rather than two that can disagree.
 		serviceRef.PublishApproval(request)
 	})
+	// When the wait ends without a grant the question is over, and the page must be
+	// told: a card that outlived its question invites a decision already recorded.
+	runner.SetApprovalWithdrawer(func(request agent.ApprovalRequest, outcome agent.ApprovalOutcome) {
+		if serviceRef == nil {
+			return
+		}
+		serviceRef.WithdrawApproval(request, outcome)
+	})
 	service := api.New(api.Config{
 		Store:       store,
 		Runner:      runner,

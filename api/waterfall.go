@@ -159,30 +159,36 @@ const defaultEventWait = 5 * time.Minute
 // the mapping explicit is what lets a page answer by the id it was given.
 type approvalFrames struct {
 	mu      sync.Mutex
-	byEvent map[string]string
+	byEvent map[string]approvalFrame
+}
+
+// approvalFrame is what one published waterfall asks about.
+type approvalFrame struct {
+	approvalID string
+	sessionID  string
 }
 
 // newApprovalFrames builds an empty map.
 func newApprovalFrames() *approvalFrames {
-	return &approvalFrames{byEvent: map[string]string{}}
+	return &approvalFrames{byEvent: map[string]approvalFrame{}}
 }
 
 // track records which approval one frame asks about.
-func (f *approvalFrames) track(eventID, approvalID string) {
+func (f *approvalFrames) track(eventID, approvalID, sessionID string) {
 	f.mu.Lock()
-	f.byEvent[eventID] = approvalID
+	f.byEvent[eventID] = approvalFrame{approvalID: approvalID, sessionID: sessionID}
 	f.mu.Unlock()
 }
 
 // take consumes the mapping and reports the approval it named.
 func (f *approvalFrames) take(eventID string) (string, bool) {
 	f.mu.Lock()
-	approvalID, ok := f.byEvent[eventID]
+	entry, ok := f.byEvent[eventID]
 	if ok {
 		delete(f.byEvent, eventID)
 	}
 	f.mu.Unlock()
-	return approvalID, ok
+	return entry.approvalID, ok
 }
 
 // publishWaterfall sends one waterfall frame and reports its id, without waiting.
@@ -207,4 +213,24 @@ func (s *Service) publishWaterfall(event, agentID string, request map[string]any
 	_ = answer
 	s.events.publish(frame)
 	return eventID, nil
+}
+
+// withdrawWaterfall tells every connected page that one question is over.
+//
+// DSH's protocol carries a `cancel` frame for exactly this: a question that was
+// delivered and will never be answered. Without it a consumer keeps the card on
+// screen and invites a decision that is already recorded.
+func (s *Service) withdrawWaterfall(eventID string) {
+	if s.events == nil || eventID == "" {
+		return
+	}
+	frame, err := encodeValue(map[string]any{
+		"type":    "cancel",
+		"eventId": eventID,
+	})
+	if err != nil {
+		s.logf("encode waterfall cancel: %v", err)
+		return
+	}
+	s.events.publish(frame)
 }

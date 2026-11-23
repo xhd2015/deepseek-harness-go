@@ -87,6 +87,9 @@ func newFixture(t *testing.T) *fixture {
 	runner.SetApprovalNotifier(func(request agent.ApprovalRequest) {
 		service.PublishApproval(request)
 	})
+	runner.SetApprovalWithdrawer(func(request agent.ApprovalRequest, outcome agent.ApprovalOutcome) {
+		service.WithdrawApproval(request, outcome)
+	})
 	return &fixture{service: service, store: store, runner: runner, model: fake, root: root}
 }
 

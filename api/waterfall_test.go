@@ -234,3 +234,58 @@ func TestEventResultRejectsUnknownIDs(t *testing.T) {
 	f.invoke(t, "$events/result", json.RawMessage(`{"eventId":"remote-event-999","outcome":{"kind":"result","value":"allowed-once"}}`)).
 		mustFail(t, CodeNotFound)
 }
+
+// TestExpiredApprovalPublishesCancel is what keeps a card from outliving its
+// question. Without the cancel frame a consumer keeps the button on screen and the
+// user answers something already recorded.
+func TestExpiredApprovalPublishesCancel(t *testing.T) {
+	f := newFixture(t)
+	f.runner.SetApprovalWindow(200 * time.Millisecond)
+	if err := os.MkdirAll(filepath.Join(f.root, "project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opened := f.createSession(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	stream, err := f.service.Open(ctx, EndpointEvents, []byte(`{"args":{}}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	stream.Next(ctx)
+
+	go func() {
+		f.runner.ToolsExecuteForTest(context.Background(), opened, "bash",
+			`{"description":"e","command":"echo x > /tmp/cancel-probe.txt","sandbox_permissions":"danger-full-access","justification":"because"}`)
+	}()
+
+	var sawWaterfall, sawCancel bool
+	for !sawCancel {
+		raw, err := stream.Next(ctx)
+		if err != nil {
+			break
+		}
+		var frame struct {
+			Type    string `json:"type"`
+			EventID string `json:"eventId"`
+		}
+		if json.Unmarshal(raw, &frame) != nil {
+			continue
+		}
+		switch frame.Type {
+		case "waterfall":
+			sawWaterfall = true
+		case "cancel":
+			if !sawWaterfall {
+				t.Fatal("a cancel arrived before the question it cancels")
+			}
+			if frame.EventID == "" {
+				t.Fatal("the cancel frame carries no eventId to correlate")
+			}
+			sawCancel = true
+		}
+	}
+	if !sawCancel {
+		t.Fatal("an expired approval published no cancel frame")
+	}
+}

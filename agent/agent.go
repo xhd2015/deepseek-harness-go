@@ -130,6 +130,8 @@ type Runner struct {
 	answerer func(ApprovalRequest) ApprovalOutcome
 	// notifyApproval tells the page a question is waiting.
 	notifyApproval func(ApprovalRequest)
+	// withdrawApproval tells the page a question is no longer waiting.
+	withdrawApproval func(ApprovalRequest, ApprovalOutcome)
 	// approvalWait bounds how long a call waits for an answer before failing closed.
 	approvalWait time.Duration
 }

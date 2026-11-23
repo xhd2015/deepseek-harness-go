@@ -211,6 +211,8 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		_ = store.Close()
 		return nil, nil, err
 	}
+	// The session store is handed to the runner as well: compaction and the
+	// manual /compact path open a session by id, with no handle in hand.
 	runner := agent.New(agent.Config{
 		Catalog:         catalog,
 		Clients:         clients,
@@ -220,7 +222,19 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		ToolRoot:        opts.ToolRoot,
 		DSHHome:         opts.DataDir,
 		ModelsPath:      opts.Models,
-		Logf:            logf,
+		Store:           store,
+		Compaction:      &agent.CompactionConfig{ContextWindowTokens: compactionWindow(catalog)},
+		Skills:          loadSkillsFor(opts, logf),
+		// The catalog is per project, so it is re-resolved for a session whose cwd
+		// differs from the boot directory. Boot-time resolution alone would give a
+		// session the skills of whatever directory the server happened to start in.
+		ResolveSkills: func(cwd string) []agent.SkillDefinition {
+			if cwd == "" || cwd == opts.ToolRoot {
+				return nil
+			}
+			return loadSkillsFor(Options{ToolRoot: cwd, DataDir: opts.DataDir}, logf)
+		},
+		Logf: logf,
 	})
 	service := api.New(api.Config{
 		Store:       store,
@@ -438,4 +452,40 @@ func sameDir(a, b string) bool {
 		return false
 	}
 	return filepath.Clean(left) == filepath.Clean(right)
+}
+
+// compactionWindow reports the window the routed model declares, or zero when it
+// declares none.
+//
+// Zero deliberately disables the automatic trigger: without a capacity there is no
+// pressure to measure, and firing compaction on a guess would replace history the
+// session still fits.
+func compactionWindow(catalog *modelconfig.Catalog) int64 {
+	if catalog == nil {
+		return 0
+	}
+	for _, provider := range catalog.Providers {
+		if provider.ID != catalog.Default.Provider {
+			continue
+		}
+		for _, model := range provider.Models {
+			if model.ID == catalog.Default.Model {
+				return int64(model.ContextWindow)
+			}
+		}
+	}
+	return 0
+}
+
+// loadSkillsFor reads the skill catalog once at boot.
+//
+// The roots are the ones DSH searches: the project's own directories, then the
+// user's, so a repository can pin instructions without renaming them.
+func loadSkillsFor(opts Options, logf func(format string, args ...any)) []agent.SkillDefinition {
+	roots := agent.SkillRoots(opts.ToolRoot, opts.DataDir, nil)
+	skills, err := agent.LoadSkills(roots)
+	if err != nil && logf != nil {
+		logf("skills: %v", err)
+	}
+	return skills
 }

@@ -38,6 +38,17 @@ func (r *Runner) driveTurn(ctx context.Context, req PromptRequest, sess *session
 		// batch or an edit), so it opens a turn without appending a user message.
 		started = r.startContinuationTurn
 	}
+	// Pressure is checked before the turn's request is assembled: a session that
+	// no longer fits its window must be compacted before the model is sent a
+	// history the provider will refuse.
+	if budget, pressure := r.shouldCompact(sess); pressure {
+		turnNumber := int64(turn)
+		if compacted, err := r.compactSurface(ctx, sess, budget, &turnNumber); err != nil {
+			r.logf("session %s: compaction: %v", sess.ID(), err)
+		} else if compacted {
+			r.logf("session %s: compacted under pressure", sess.ID())
+		}
+	}
 	if err := started(sess, req, turn, TextContent(req.Content)); err != nil {
 		r.logf("session %s: start turn: %v", sess.ID(), err)
 		r.endTurn(sess, turn, map[string]any{"kind": "error", "error": failureOf(err)})

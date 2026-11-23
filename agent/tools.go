@@ -71,6 +71,9 @@ type ToolExecutor struct {
 	initErr    error
 	observed   observationStore
 	jobs       *jobManager
+	// skills is the catalog this executor can load by name. It is resolved once
+	// per executor so a load does not walk the directories again.
+	skills []SkillDefinition
 }
 
 type observationStore struct {
@@ -123,6 +126,14 @@ func (e *ToolExecutor) SetDSHHome(home string) {
 		return
 	}
 	e.dshHome = home
+}
+
+// SetSkills records the catalog the skill tool may load from.
+func (e *ToolExecutor) SetSkills(skills []SkillDefinition) {
+	if e == nil {
+		return
+	}
+	e.skills = skills
 }
 
 // SetPolicy records the permission/sandbox modes used for mutation checks.
@@ -210,6 +221,107 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 						"description": "Existing directory to enter. Omit to read the current directory.",
 					},
 				},
+			},
+		},
+		{
+			Name:        presentToolName,
+			Description: presentDescription,
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"files": map[string]any{
+						"type":        "array",
+						"description": "Usually the 1-2 most important deliverables; at most 4 per call.",
+						"items": map[string]any{
+							"type":                 "object",
+							"additionalProperties": false,
+							"properties": map[string]any{
+								"path": map[string]any{
+									"type":        "string",
+									"description": "Path of an existing regular file. Relative paths use the Session working directory.",
+								},
+								"description": map[string]any{
+									"type":        "string",
+									"description": "Brief description for the user.",
+								},
+							},
+							"required": []string{"path"},
+						},
+					},
+				},
+				"required": []string{"files"},
+			},
+		},
+		{
+			Name:        skillToolName,
+			Description: skillDescription,
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "The exact skill name from the available skills list.",
+					},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			Name:        getGoalToolName,
+			Description: getGoalDescription,
+			Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			Name:        createGoalToolName,
+			Description: createGoalDescription,
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"objective": map[string]any{
+						"type":        "string",
+						"description": "The concrete completion objective inferred from the direct human request.",
+					},
+					"max_goal_rounds": map[string]any{
+						"type":        "number",
+						"description": "Optional positive safe-integer limit on automatic continuation rounds.",
+					},
+				},
+				"required": []string{"objective"},
+			},
+		},
+		{
+			Name:        updateGoalToolName,
+			Description: updateGoalDescription,
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"goal_id": map[string]any{
+						"type":        "string",
+						"description": "Exact id returned by get_goal.",
+					},
+					"revision": map[string]any{
+						"type":        "number",
+						"description": "Exact positive revision returned by get_goal.",
+					},
+					"action": map[string]any{
+						"type":        "string",
+						"description": "edit, pause, and resume require a direct top-level human request. complete and blocked are also allowed during an automatic continuation of this goal; blocked is rejected before the configured minimum round count.",
+						"enum":        []string{"edit", "pause", "resume", "complete", "blocked"},
+					},
+					"objective": map[string]any{
+						"type":        "string",
+						"description": "Replacement objective; valid only with action edit.",
+					},
+					"max_goal_rounds": map[string]any{
+						"type":        "number",
+						"description": "Replacement cap; valid only with action edit.",
+					},
+					"blocked_reason": map[string]any{
+						"type":        "string",
+						"description": "Required only with action blocked: the concrete condition that persisted across rounds and blocks progress.",
+					},
+				},
+				"required": []string{"goal_id", "revision", "action"},
 			},
 		},
 		{
@@ -439,6 +551,16 @@ func (e *ToolExecutor) ExecuteOutcome(ctx context.Context, inv ToolInvocation) T
 		return e.askUserQuestion(ctx, inv, args)
 	case workingDirectoryToolName:
 		return e.workingDirectory(ctx, inv, args)
+	case presentToolName:
+		return e.present(ctx, inv, args)
+	case skillToolName:
+		return e.skill(ctx, inv, args)
+	case getGoalToolName:
+		return e.getGoal(ctx, inv)
+	case createGoalToolName:
+		return e.createGoal(ctx, inv, args)
+	case updateGoalToolName:
+		return e.updateGoal(ctx, inv, args)
 	case "todo_write":
 		return e.todoWrite(inv, args)
 	case "job_output":

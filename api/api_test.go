@@ -53,6 +53,7 @@ func newFixture(t *testing.T) *fixture {
 		Client:   llm.New(llm.Config{BaseURL: model.URL, Model: "fake-model", APIKey: "k"}),
 		Provider: "fake-provider",
 		Model:    "fake-model",
+		Store:    store,
 	})
 	t.Cleanup(runner.Close)
 	cwd := filepath.Join(root, "project")

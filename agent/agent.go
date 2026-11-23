@@ -64,6 +64,17 @@ type Config struct {
 	// HistoryLimit caps how many transcript messages are sent back; zero keeps
 	// the whole transcript.
 	HistoryLimit int
+	// Compaction configures the pressure-driven compaction of long sessions. Nil
+	// leaves it off, which is what a caller that manages its own window wants.
+	Compaction *CompactionConfig
+	// Store opens a session by id for work that has no handle in hand, such as a
+	// manual compaction request. Nil disables the manual path.
+	Store *session.Store
+	// Skills is the catalog the skill tool may load from.
+	Skills []SkillDefinition
+	// ResolveSkills re-resolves the catalog for a session whose cwd differs from
+	// the boot directory. Nil keeps the boot-time catalog.
+	ResolveSkills func(cwd string) []SkillDefinition
 	// ToolRoot is the fallback workspace for tool calls whose session has no
 	// recorded cwd, and the directory validated at startup. It does not limit
 	// reads. Empty uses the process working directory.
@@ -128,6 +139,10 @@ func New(cfg Config) *Runner {
 	tools := NewToolExecutor(cfg.ToolRoot)
 	tools.SetPolicy(cfg.PermissionPreset, cfg.SandboxMode)
 	tools.SetDSHHome(cfg.DSHHome)
+	// Skills are resolved once per runner: a load must not walk the directories
+	// again on every tool call, and a catalog that changes mid-session would make
+	// the model's earlier choices look wrong.
+	tools.SetSkills(cfg.Skills)
 	if cfg.ToolRoot != "" && tools.InitError() != nil && cfg.Logf != nil {
 		cfg.Logf("tools disabled: %v", tools.InitError())
 	}
@@ -295,6 +310,27 @@ func (r *Runner) ensurePreamble(sess *session.Session) error {
 		}
 		if _, err := sess.Append(step.typ, step.data); err != nil {
 			return err
+		}
+	}
+	// The catalog is injected once, before the first turn: a model that cannot see
+	// a skill's name cannot ask for it, and the `skill` tool would be reachable
+	// only by guessing.
+	if !seen[skillCatalogEventType] {
+		if catalog := renderSkillCatalog(r.skillsFor(sess)); catalog != "" {
+			if _, err := sess.AppendSurface(session.EventUserMessage, map[string]any{
+				"role":    "user",
+				"id":      session.NewID(),
+				"content": []any{map[string]any{"type": "text", "text": catalog}},
+				"source": map[string]any{
+					"kind": "skill-catalog",
+					"form": "catalog",
+					// The entries are recorded beside the prose, so a consumer that
+					// lists skills does not have to parse the model-facing block.
+					"entries": skillCatalogEntries(r.skillsFor(sess)),
+				},
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	// Older sessions predate the model catalog. Give them a valid selection

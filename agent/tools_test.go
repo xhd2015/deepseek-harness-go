@@ -55,7 +55,13 @@ func TestToolDefinitions(t *testing.T) {
 	// The list is what the model is offered, in order. working_directory and
 	// ask_user_question are both ordinary entries: neither waits on anything, so
 	// neither needs a special position.
-	want := []string{"bash", "working_directory", "ask_user_question", "read", "write", "edit", "glob", "todo_write", "job_output", "job_list", "job_kill", "read_image", "web_search", "web_fetch", "grep"}
+	want := []string{
+		"bash", "working_directory", "present", "skill",
+		"get_goal", "create_goal", "update_goal",
+		"ask_user_question", "read", "write", "edit", "glob", "todo_write",
+		"job_output", "job_list", "job_kill", "read_image",
+		"web_search", "web_fetch", "grep",
+	}
 	if len(definitions) != len(want) {
 		t.Fatalf("got %d tool definitions, want %d", len(definitions), len(want))
 	}

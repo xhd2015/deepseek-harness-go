@@ -212,6 +212,16 @@ func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 		return s.fork(args)
 	case "userQuestions/answer":
 		return s.answerQuestion(args)
+	case "session/compact":
+		return s.compact(args)
+	case "session/compaction":
+		return s.compaction(args)
+	case "session/compactIntoNew":
+		return s.compactIntoNew(args)
+	case "commands/list":
+		return s.commandsList(args)
+	case "commands/execute":
+		return s.commandsExecute(args)
 	}
 	return nil, s.unimplemented(endpoint)
 }

@@ -361,6 +361,7 @@ func Single(provider, model, effort string) *Catalog {
 			Models: []Model{{
 				ID:            model,
 				Name:          model,
+				ContextWindow: DefaultContextWindow,
 				DefaultEffort: effort,
 			}},
 		}},
@@ -495,3 +496,11 @@ func mappingValue(node *yaml.Node, key string) *yaml.Node {
 	}
 	return nil
 }
+
+// DefaultContextWindow is the capacity assumed when a catalog entry declares none.
+//
+// Assuming a capacity is what keeps automatic compaction working for a catalog
+// that predates the field: with no window at all there is no pressure to measure,
+// and a long session would simply start failing instead of being compacted.
+// Declaring the real window in the catalog always wins.
+const DefaultContextWindow = 128000

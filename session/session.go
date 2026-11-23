@@ -576,3 +576,29 @@ func newSession(store *Store, dir, path string, header Header, compression Compr
 		encoder: encoder, hold: hold, writable: file != nil,
 	}
 }
+
+// Surface reports the events the model is currently shown, in order.
+//
+// A compaction replaces a span rather than deleting it, so the surface is what a
+// reader reconstructs from the replace ops — not the raw log. It is what a
+// pressure check must measure, because bytes already replaced are no longer sent.
+func (s *Session) Surface() []Event {
+	events := s.Events()
+	replaced := map[int64]bool{}
+	for _, event := range events {
+		if event.SurfaceOp == nil || !event.SurfaceOp.IsReplace() {
+			continue
+		}
+		for seq := event.SurfaceOp.StartSeq; seq <= event.SurfaceOp.EndSeq; seq++ {
+			replaced[seq] = true
+		}
+	}
+	surface := make([]Event, 0, len(events))
+	for _, event := range events {
+		if replaced[event.Seq] {
+			continue
+		}
+		surface = append(surface, event)
+	}
+	return surface
+}

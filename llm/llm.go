@@ -28,10 +28,14 @@ const (
 
 // Config configures a Client.
 type Config struct {
-	BaseURL    string
-	APIKey     string
-	Model      string
-	Protocol   string
+	BaseURL  string
+	APIKey   string
+	Model    string
+	Protocol string
+	// Provider names the route this client speaks for. It decides provider-specific
+	// attribution headers (OpenCode requires its own session header); empty means
+	// only the generic headers are sent.
+	Provider   string
 	HTTPClient *http.Client
 	// Headers are added to every request.
 	Headers map[string]string

@@ -77,6 +77,8 @@ type Service struct {
 	events     *eventHub
 	// waterfalls carries pending client questions the host is blocked on.
 	waterfalls *waterfallGate
+	// approvalFrames maps a waterfall frame to the approval it asks about.
+	approvalFrames *approvalFrames
 }
 
 // New builds the endpoint service.
@@ -100,11 +102,12 @@ func New(cfg Config) *Service {
 		cfg.Drafts = &Drafts{texts: map[string]string{}}
 	}
 	service := &Service{
-		cfg:        cfg,
-		Workspaces: cfg.Workspaces,
-		events:     newEventHub(),
-		waterfalls: newWaterfallGate(),
-		drafts:     cfg.Drafts,
+		cfg:            cfg,
+		Workspaces:     cfg.Workspaces,
+		events:         newEventHub(),
+		waterfalls:     newWaterfallGate(),
+		approvalFrames: newApprovalFrames(),
+		drafts:         cfg.Drafts,
 	}
 	if cfg.Runner != nil {
 		cfg.Runner.SetOnStatus(func(sessionID string, running bool) {
@@ -238,10 +241,6 @@ func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 		return s.permissionPresetsSet(args)
 	case "$events/result":
 		return s.eventResult(args)
-	case "approval/answer":
-		return s.answerApproval(args)
-	case "approval/pending":
-		return s.pendingApprovals(args)
 	case "agentPresets/list":
 		return s.agentPresetsList(args)
 	case "agentPresets/read":

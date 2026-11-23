@@ -108,6 +108,9 @@ func (c *Client) streamOnce(ctx context.Context, encoded []byte, sessionID strin
 	setIfAbsent(request.Header, agentRunnerHeader, agentRunnerValue)
 	if sessionID != "" {
 		setIfAbsent(request.Header, dshSessionHeader, sessionID)
+		if usesOpenCodeSessionHeader(c.cfg.Provider) {
+			setIfAbsent(request.Header, opencodeSessionHeader, sessionID)
+		}
 	}
 	response, err := c.cfg.HTTPClient.Do(request)
 	if err != nil {
@@ -1998,7 +2001,29 @@ const (
 	// dshSessionHeader carries the durable session id for per-conversation
 	// billing and routing.
 	dshSessionHeader = "x-dsh-session-id"
+	// opencodeSessionHeader is OpenCode Go's required conversation-routing header.
+	// Its upstreams key the prompt cache on it and reject a request that omits it,
+	// so a route without it answers "MissingSessionID" instead of completing.
+	opencodeSessionHeader = "x-opencode-session"
 )
+
+// usesOpenCodeSessionHeader reports whether a provider expects the OpenCode header.
+//
+// Matching is DSH's: the literal provider names plus any provider whose name
+// carries an `opencode` segment, which covers the llm-proxy exports such as
+// `llm-proxy-opencode`.
+func usesOpenCodeSessionHeader(provider string) bool {
+	if provider == "opencode" || provider == "opencode-go" {
+		return true
+	}
+	// `(?:^|-)opencode(?:-|$)`
+	for _, segment := range strings.Split(provider, "-") {
+		if segment == "opencode" {
+			return true
+		}
+	}
+	return false
+}
 
 // setIfAbsent sets a header unless the deployment already configured one.
 func setIfAbsent(headers http.Header, name, value string) {

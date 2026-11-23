@@ -149,13 +149,18 @@ func (r *Runner) askApproval(sess *session.Session, toolName, callID, reason str
 		if r.notifyApproval == nil {
 			outcome = ApprovalUnavailable
 		} else {
-			// The notifier delivers the question and may block until the page
-			// answers; whatever it delivers comes back through `answer`, so there is
-			// one path for the decision rather than two.
-			r.notifyApproval(request)
+			// The notifier must only DELIVER the question. Running the wait inside it
+			// made the answer undeliverable: the notifier blocked on the waterfall
+			// until its own timeout, so a decision arriving on `answer` had nothing
+			// reading it and the caller waited out the whole window while the page
+			// showed no pending item. Publishing asynchronously and waiting here
+			// keeps one wait, owned by the caller.
+			go r.notifyApproval(request)
+			// The wait is bounded by the same window the page is given: a decision
+			// that never arrives must release the call, not hold the turn open.
 			select {
 			case outcome = <-answer:
-			case <-time.After(r.approvalWait):
+			case <-time.After(r.approvalWindow()):
 				outcome = ApprovalUnavailable
 			}
 		}
@@ -227,5 +232,26 @@ func (r *Runner) ToolsExecuteForTest(ctx context.Context, sess *session.Session,
 func (r *Runner) ClearApprovalNotifier() {
 	r.mu.Lock()
 	r.notifyApproval = nil
+	r.mu.Unlock()
+}
+
+// approvalWindow bounds how long a call waits for a decision.
+func (r *Runner) approvalWindow() time.Duration {
+	r.mu.Lock()
+	window := r.approvalWait
+	r.mu.Unlock()
+	if window <= 0 {
+		return 5 * time.Minute
+	}
+	return window
+}
+
+// SetApprovalWindow changes how long a call waits for a decision.
+//
+// A test shortens it rather than waiting out the production default; a deployment
+// may lengthen it when its operator steps away.
+func (r *Runner) SetApprovalWindow(window time.Duration) {
+	r.mu.Lock()
+	r.approvalWait = window
 	r.mu.Unlock()
 }

@@ -92,9 +92,12 @@ func TestApprovalWithoutAnAnswererFailsClosed(t *testing.T) {
 }
 
 // TestApprovalAnswerRejectsUnknownIds keeps a stale page from believing it acted.
+//
+// The answer channel is `$events/result`, the same one a native host exposes; the
+// invented `approval/answer` RPC is gone because it settled a second channel the
+// page could not see, so a granted decision left the call waiting.
 func TestApprovalAnswerRejectsUnknownIds(t *testing.T) {
 	f := newFixture(t)
-	f.invoke(t, "approval/answer", map[string]any{
-		"id": "approval-does-not-exist", "outcome": "allowed-once",
-	}).mustFail(t, CodeNotFound)
+	f.invoke(t, "$events/result", json.RawMessage(`{"eventId":"remote-event-404","outcome":{"kind":"result","value":"allowed-once"}}`)).
+		mustFail(t, CodeNotFound)
 }

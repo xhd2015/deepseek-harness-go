@@ -127,7 +127,13 @@ func (s *Service) eventResult(args json.RawMessage) (any, error) {
 		// A listener that answered. Settling an unknown id means the question was
 		// already settled or never existed; reporting success would let a stale page
 		// believe it decided something.
-		if !s.waterfalls.settle(result.EventID, result.Outcome.Value) {
+		//
+		// An approval frame settles the approval the tool call is waiting on, so the
+		// decision unblocks the call. The waterfall wait is settled too, for frames
+		// that are genuinely answers rather than approvals.
+		settledApproval := s.settleApprovalFrame(result.EventID, result.Outcome.Value)
+		settledWait := s.waterfalls.settle(result.EventID, result.Outcome.Value)
+		if !settledApproval && !settledWait {
 			return nil, fail(CodeNotFound, "no waterfall is waiting for "+result.EventID)
 		}
 		return map[string]any{"ok": true}, nil
@@ -145,3 +151,60 @@ func (s *Service) eventResult(args json.RawMessage) (any, error) {
 
 // defaultEventWait bounds a waterfall wait when the deployment sets no window.
 const defaultEventWait = 5 * time.Minute
+
+// approvalFrames maps a published waterfall frame to the approval it asks about.
+//
+// The two ids exist for different reasons: the waterfall id correlates the frame
+// with its answer, and the approval id names the audit pair on the session. Keeping
+// the mapping explicit is what lets a page answer by the id it was given.
+type approvalFrames struct {
+	mu      sync.Mutex
+	byEvent map[string]string
+}
+
+// newApprovalFrames builds an empty map.
+func newApprovalFrames() *approvalFrames {
+	return &approvalFrames{byEvent: map[string]string{}}
+}
+
+// track records which approval one frame asks about.
+func (f *approvalFrames) track(eventID, approvalID string) {
+	f.mu.Lock()
+	f.byEvent[eventID] = approvalID
+	f.mu.Unlock()
+}
+
+// take consumes the mapping and reports the approval it named.
+func (f *approvalFrames) take(eventID string) (string, bool) {
+	f.mu.Lock()
+	approvalID, ok := f.byEvent[eventID]
+	if ok {
+		delete(f.byEvent, eventID)
+	}
+	f.mu.Unlock()
+	return approvalID, ok
+}
+
+// publishWaterfall sends one waterfall frame and reports its id, without waiting.
+func (s *Service) publishWaterfall(event, agentID string, request map[string]any) (string, error) {
+	if s.events == nil {
+		return "", fmt.Errorf("no event stream to publish on")
+	}
+	eventID, answer := s.waterfalls.ask()
+	frame, err := encodeValue(map[string]any{
+		"type":    "waterfall",
+		"event":   event,
+		"eventId": eventID,
+		"agentId": agentID,
+		"request": request,
+	})
+	if err != nil {
+		s.waterfalls.cancel(eventID)
+		return "", err
+	}
+	// The answer channel is kept so the shared wait can settle; `$events/result`
+	// delivers through it.
+	_ = answer
+	s.events.publish(frame)
+	return eventID, nil
+}

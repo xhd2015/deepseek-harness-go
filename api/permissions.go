@@ -101,69 +101,46 @@ func applyPreset(opened *session.Session, preset session.PresetSpec) error {
 	return nil
 }
 
-// answerApproval answers approval/answer: the page's decision on one question.
+// PublishApproval sends the question to the page and returns immediately.
 //
-// The outcome is delivered, not recorded here: the waiting tool call writes the
-// matching `approval/decided` so the pair stays turn-enclosed and in order.
-func (s *Service) answerApproval(args json.RawMessage) (any, error) {
-	var request struct {
-		ID         string `json:"id"`
-		ApprovalID string `json:"approvalId"`
-		Outcome    string `json:"outcome"`
-	}
-	if err := decodeEitherShape(args, &request); err != nil {
-		return nil, fail(CodeBadRequest, err.Error())
-	}
-	id := strings.TrimSpace(request.ID)
-	if id == "" {
-		id = strings.TrimSpace(request.ApprovalID)
-	}
-	if id == "" {
-		return nil, fail(CodeBadRequest, "an approval id is required")
-	}
-	outcome := strings.TrimSpace(request.Outcome)
-	if outcome == "" {
-		return nil, fail(CodeBadRequest, "an approval outcome is required")
-	}
-	if s.cfg.Runner == nil {
-		return nil, fail(CodeUnimplemented, "approvals need a runner")
-	}
-	if !s.cfg.Runner.AnswerApproval(id, agent.ApprovalOutcome(outcome)) {
-		// No such question: it was already settled, or it never existed. Reporting
-		// success would let a stale page believe it changed a decision.
-		return nil, fail(CodeNotFound, "no approval is waiting for "+id)
-	}
-	return map[string]any{"id": id, "outcome": outcome}, nil
-}
-
-// pendingApprovals answers approval/pending, for a page that just reconnected.
-func (s *Service) pendingApprovals(args json.RawMessage) (any, error) {
-	if s.cfg.Runner == nil {
-		return map[string]any{"approvals": []any{}}, nil
-	}
-	requests := s.cfg.Runner.PendingApprovals()
-	return map[string]any{"approvals": requests}, nil
-}
-
-// requestApprovalOverWaterfall asks the page through the waterfall protocol.
+// The wait belongs to the tool call, which is blocked on the runner's approval
+// gate. Waiting here as well is what made an answer arrive with nothing reading it:
+// the page showed no pending item and the caller sat until the window expired.
 //
-// This is the shape the original UI answers: a `waterfall` frame the client's
-// `approval/request` listener receives, and a `$events/result` reply. A plain
-// `emit` would show nothing clickable, which is how the first attempt failed.
-func (s *Service) requestApprovalOverWaterfall(request agent.ApprovalRequest) agent.ApprovalOutcome {
-	value, answered := s.requestWaterfall("approval/request", request.Session, map[string]any{
+// The approval id, not the waterfall id, names the audit pair. `$events/result`
+// carries the waterfall id, so the mapping is kept explicitly.
+func (s *Service) PublishApproval(request agent.ApprovalRequest) {
+	eventID, err := s.publishWaterfall("approval/request", request.Session, map[string]any{
 		"toolName": request.ToolName,
 		"callId":   request.CallID,
 		"reason":   request.Reason,
+		// The approval id travels with the request as well, so a page that keeps the
+		// id it rendered can answer without depending on the frame correlation.
+		"id": request.ID,
 	})
-	if !answered {
-		// Nobody decided. Fail closed: a turn must not hang on a page that is gone.
-		return agent.ApprovalUnavailable
+	if err != nil {
+		s.logf("publish approval: %v", err)
+		return
 	}
+	s.approvalFrames.track(eventID, request.ID)
+}
+
+// settleApprovalFrame delivers a page's answer to the approval it asked about.
+func (s *Service) settleApprovalFrame(eventID string, value json.RawMessage) bool {
+	approvalID, ok := s.approvalFrames.take(eventID)
+	if !ok {
+		return false
+	}
+	if s.cfg.Runner != nil {
+		s.cfg.Runner.AnswerApproval(approvalID, outcomeOf(value))
+	}
+	return true
+}
+
+// outcomeOf reads the outcome a page returned, in either accepted spelling.
+func outcomeOf(value json.RawMessage) agent.ApprovalOutcome {
 	var outcome string
 	if len(value) > 0 {
-		// The listener returns the outcome as a JSON string or as an object with an
-		// `outcome` field; accept both, since both spellings appear in the protocol.
 		if err := json.Unmarshal(value, &outcome); err != nil {
 			var wrapped struct {
 				Outcome string `json:"outcome"`
@@ -180,15 +157,3 @@ func (s *Service) requestApprovalOverWaterfall(request agent.ApprovalRequest) ag
 		return agent.ApprovalUnavailable
 	}
 }
-
-// RequestApprovalOverWaterfall asks the page and reports its decision.
-//
-// The caller delivers the outcome back through the runner, which unblocks the tool
-// call; the tool then writes the matching `approval/decided`. Splitting it here
-// keeps the audit pair in the order it happened.
-func (s *Service) RequestApprovalOverWaterfall(request agent.ApprovalRequest) agent.ApprovalOutcome {
-	return s.requestApprovalOverWaterfall(request)
-}
-
-// Runner exposes the runner this service drives, for the approval round trip.
-func (s *Service) Runner() *agent.Runner { return s.cfg.Runner }

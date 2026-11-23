@@ -244,10 +244,10 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		if serviceRef == nil {
 			return
 		}
-		// Ask the page and deliver the answer back through the runner, so the tool
-		// call is unblocked by the decision rather than by a second channel.
-		outcome := serviceRef.RequestApprovalOverWaterfall(request)
-		serviceRef.Runner().AnswerApproval(request.ID, outcome)
+		// Publish only. The answer arrives through $events/result and is settled
+		// against the same wait the tool call is blocked on, so there is one chain
+		// from question to decision rather than two that can disagree.
+		serviceRef.PublishApproval(request)
 	})
 	service := api.New(api.Config{
 		Store:       store,
@@ -366,6 +366,7 @@ func buildModelSurface(opts Options, logf func(format string, args ...any)) (*mo
 			APIKey:   opts.APIKey,
 			Model:    opts.Model,
 			Protocol: opts.Protocol,
+			Provider: opts.Provider,
 		})
 		return catalog, map[string]*llm.Client{
 			modelRouteKey(opts.Provider, opts.Model): client,
@@ -445,6 +446,9 @@ func buildModelSurface(opts Options, logf func(format string, args ...any)) (*mo
 			BaseURL:  provider.BaseURL,
 			APIKey:   provider.APIKey,
 			Protocol: provider.Protocol,
+			// The provider name decides provider-specific attribution headers: an
+			// OpenCode route rejects a request that omits its session header.
+			Provider: provider.ID,
 		})
 		for _, model := range provider.Models {
 			clients[modelRouteKey(provider.ID, model.ID)] = client

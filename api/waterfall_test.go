@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -102,10 +104,90 @@ func TestApprovalTravelsAsAWaterfall(t *testing.T) {
 	}
 }
 
+// TestApprovalAnswerUnblocksImmediately is the regression this fixes: answering a
+// waterfall must release the waiting call at once, not at the end of the window.
+//
+// The previous wiring had two waits — the notifier blocked on the waterfall while
+// the tool blocked on the runner — so the answer settled a channel nobody was
+// reading. The symptom was a page with no pending item and a turn stuck for the
+// full timeout.
+func TestApprovalAnswerUnblocksImmediately(t *testing.T) {
+	f := newFixture(t)
+	// A window long enough that waiting it out would fail the assertion below.
+	f.service.cfg.EventWait = 60 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	stream, err := f.service.Open(ctx, EndpointEvents, []byte(`{"args":{}}`), nil)
+	if err != nil {
+		t.Fatalf("open events: %v", err)
+	}
+	defer stream.Close()
+	if _, err := stream.Next(ctx); err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+
+	homeDir, _ := os.UserHomeDir()
+	target := filepath.Join(homeDir, "unblock-now.txt")
+	_ = os.RemoveAll(target)
+	t.Cleanup(func() { _ = os.RemoveAll(target) })
+	if err := os.MkdirAll(filepath.Join(f.root, "project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opened := f.createSession(t)
+
+	type res struct{ outcome agent.ToolOutcome }
+	done := make(chan res, 1)
+	start := time.Now()
+	go func() {
+		done <- res{outcome: f.runner.ToolsExecuteForTest(ctx, opened, "bash",
+			`{"description":"escalate","command":"echo x > `+target+`","sandbox_permissions":"danger-full-access","justification":"needs a path outside"}`)}
+	}()
+
+	// Answer the frame as soon as it arrives.
+	var eventID string
+	for eventID == "" {
+		raw, err := stream.Next(ctx)
+		if err != nil {
+			t.Fatalf("no waterfall frame: %v", err)
+		}
+		var frame struct {
+			Type    string `json:"type"`
+			Event   string `json:"event"`
+			EventID string `json:"eventId"`
+		}
+		if json.Unmarshal(raw, &frame) == nil && frame.Type == "waterfall" && frame.Event == "approval/request" {
+			eventID = frame.EventID
+		}
+	}
+	answer, _ := json.Marshal(map[string]any{
+		"clientId": "c", "eventId": eventID,
+		"outcome": map[string]any{"kind": "result", "value": "allowed-once"},
+	})
+	f.invoke(t, "$events/result", json.RawMessage(answer)).mustSucceed(t)
+
+	select {
+	case got := <-done:
+		if got.outcome.IsError {
+			t.Fatalf("the approved call failed: %s", got.outcome.Text)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("the call unblocked after %v: the answer is not what released it", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call never unblocked after a granted answer")
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("the approved command did not run: %v", err)
+	}
+}
+
 // TestApprovalWaterfallTimesOutFailClosed covers a page that went away.
 func TestApprovalWaterfallTimesOutFailClosed(t *testing.T) {
 	f := newFixture(t)
+	// Both windows are shortened: the waterfall publish and the runner's wait are
+	// separate timers, and the call waits on the runner's.
 	f.service.cfg.EventWait = 120 * time.Millisecond
+	f.runner.SetApprovalWindow(120 * time.Millisecond)
 	opened := f.createSession(t)
 	start := time.Now()
 	outcome := f.runner.RequestApprovalForTest(opened, "bash", "call-t", "reason")

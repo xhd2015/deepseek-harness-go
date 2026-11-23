@@ -82,6 +82,9 @@ func TestApprovalUnderNeverDoesNotAsk(t *testing.T) {
 // means no grant.
 func TestApprovalWithoutAnAnswererFailsClosed(t *testing.T) {
 	f := newFixture(t)
+	// The fixture wires a page hook by default; remove it so this covers the
+	// deployment where nothing is listening at all.
+	f.runner.ClearApprovalNotifier()
 	opened := f.createSession(t)
 	if got := f.runner.RequestApprovalForTest(opened, "bash", "c", "reason"); got != agent.ApprovalUnavailable {
 		t.Fatalf("outcome = %q, want unavailable", got)

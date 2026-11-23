@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/xhd2015/deepseek-harness-go/agent"
 	"github.com/xhd2015/deepseek-harness-go/llm"
@@ -52,6 +53,9 @@ type Config struct {
 	Drafts *Drafts
 	// ReloadModels re-reads the model catalog for session/refreshModelCatalog.
 	ReloadModels func(path string) (*modelconfig.Catalog, map[string]*llm.Client, error)
+	// EventWait bounds how long a waterfall waits for the page to answer. Zero
+	// uses the default; a test shortens it rather than waiting five minutes.
+	EventWait time.Duration
 	// SaveDefaultModel persists session/selectDefaultModel.
 	SaveDefaultModel func(selection modelconfig.Selection) error
 	// SetDefaultModel applies a new deployment default for sessions created
@@ -71,6 +75,8 @@ type Service struct {
 	drafts     *Drafts
 	receipts   requestReceipts
 	events     *eventHub
+	// waterfalls carries pending client questions the host is blocked on.
+	waterfalls *waterfallGate
 }
 
 // New builds the endpoint service.
@@ -93,7 +99,13 @@ func New(cfg Config) *Service {
 	if cfg.Drafts == nil {
 		cfg.Drafts = &Drafts{texts: map[string]string{}}
 	}
-	service := &Service{cfg: cfg, Workspaces: cfg.Workspaces, events: newEventHub(), drafts: cfg.Drafts}
+	service := &Service{
+		cfg:        cfg,
+		Workspaces: cfg.Workspaces,
+		events:     newEventHub(),
+		waterfalls: newWaterfallGate(),
+		drafts:     cfg.Drafts,
+	}
 	if cfg.Runner != nil {
 		cfg.Runner.SetOnStatus(func(sessionID string, running bool) {
 			service.Emit(EventSessionStatus, sessionID, running)
@@ -224,6 +236,8 @@ func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 		return s.permissionPresetsCatalog(args)
 	case "permissionPresets/set":
 		return s.permissionPresetsSet(args)
+	case "$events/result":
+		return s.eventResult(args)
 	case "approval/answer":
 		return s.answerApproval(args)
 	case "approval/pending":

@@ -241,9 +241,13 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 	// looks to the user like a hang rather than a question.
 	var serviceRef *api.Service
 	runner.SetApprovalNotifier(func(request agent.ApprovalRequest) {
-		if serviceRef != nil {
-			serviceRef.Emit("approval/request", request)
+		if serviceRef == nil {
+			return
 		}
+		// Ask the page and deliver the answer back through the runner, so the tool
+		// call is unblocked by the decision rather than by a second channel.
+		outcome := serviceRef.RequestApprovalOverWaterfall(request)
+		serviceRef.Runner().AnswerApproval(request.ID, outcome)
 	})
 	service := api.New(api.Config{
 		Store:       store,

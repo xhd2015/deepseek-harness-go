@@ -144,3 +144,51 @@ func (s *Service) pendingApprovals(args json.RawMessage) (any, error) {
 	requests := s.cfg.Runner.PendingApprovals()
 	return map[string]any{"approvals": requests}, nil
 }
+
+// requestApprovalOverWaterfall asks the page through the waterfall protocol.
+//
+// This is the shape the original UI answers: a `waterfall` frame the client's
+// `approval/request` listener receives, and a `$events/result` reply. A plain
+// `emit` would show nothing clickable, which is how the first attempt failed.
+func (s *Service) requestApprovalOverWaterfall(request agent.ApprovalRequest) agent.ApprovalOutcome {
+	value, answered := s.requestWaterfall("approval/request", request.Session, map[string]any{
+		"toolName": request.ToolName,
+		"callId":   request.CallID,
+		"reason":   request.Reason,
+	})
+	if !answered {
+		// Nobody decided. Fail closed: a turn must not hang on a page that is gone.
+		return agent.ApprovalUnavailable
+	}
+	var outcome string
+	if len(value) > 0 {
+		// The listener returns the outcome as a JSON string or as an object with an
+		// `outcome` field; accept both, since both spellings appear in the protocol.
+		if err := json.Unmarshal(value, &outcome); err != nil {
+			var wrapped struct {
+				Outcome string `json:"outcome"`
+			}
+			if json.Unmarshal(value, &wrapped) == nil {
+				outcome = wrapped.Outcome
+			}
+		}
+	}
+	switch agent.ApprovalOutcome(outcome) {
+	case agent.ApprovalAllowedOnce, agent.ApprovalRejected, agent.ApprovalCancelled, agent.ApprovalUnavailable:
+		return agent.ApprovalOutcome(outcome)
+	default:
+		return agent.ApprovalUnavailable
+	}
+}
+
+// RequestApprovalOverWaterfall asks the page and reports its decision.
+//
+// The caller delivers the outcome back through the runner, which unblocks the tool
+// call; the tool then writes the matching `approval/decided`. Splitting it here
+// keeps the audit pair in the order it happened.
+func (s *Service) RequestApprovalOverWaterfall(request agent.ApprovalRequest) agent.ApprovalOutcome {
+	return s.requestApprovalOverWaterfall(request)
+}
+
+// Runner exposes the runner this service drives, for the approval round trip.
+func (s *Service) Runner() *agent.Runner { return s.cfg.Runner }

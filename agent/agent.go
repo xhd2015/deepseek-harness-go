@@ -207,7 +207,10 @@ func New(cfg Config) *Runner {
 			}
 		}
 	}
-	return &Runner{
+	// The approval hook closes over the runner, so the runner has to exist before
+	// the hook can be used. Building it first and assigning here is what makes an
+	// escalation reach the page instead of failing closed forever.
+	created := &Runner{
 		cfg:             cfg,
 		catalog:         catalog,
 		clients:         clients,
@@ -219,6 +222,8 @@ func New(cfg Config) *Runner {
 		approvalWait:    5 * time.Minute,
 		waking:          map[string]bool{},
 	}
+	runner = created
+	return created
 }
 
 // Catalog returns the model catalog this runner routes over.

@@ -139,6 +139,10 @@ func validEndpoint(endpoint string) bool {
 			switch {
 			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
 			case r == '_', r == '-', r == '.':
+			case r == '$':
+				// The protocol reserves a `$` prefix for client-side plumbing; the
+				// waterfall answer (`$events/result`) is one of those endpoints and
+				// must be reachable or an approval can never be answered.
 			default:
 				return false
 			}

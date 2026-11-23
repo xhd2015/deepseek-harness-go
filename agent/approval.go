@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -148,6 +149,9 @@ func (r *Runner) askApproval(sess *session.Session, toolName, callID, reason str
 		if r.notifyApproval == nil {
 			outcome = ApprovalUnavailable
 		} else {
+			// The notifier delivers the question and may block until the page
+			// answers; whatever it delivers comes back through `answer`, so there is
+			// one path for the decision rather than two.
 			r.notifyApproval(request)
 			select {
 			case outcome = <-answer:
@@ -199,5 +203,29 @@ func (r *Runner) RequestApprovalForTest(sess *session.Session, toolName, callID,
 func (r *Runner) SetApprovalAnswerer(answer func(ApprovalRequest) ApprovalOutcome) {
 	r.mu.Lock()
 	r.answerer = answer
+	r.mu.Unlock()
+}
+
+// ToolsExecuteForTest exposes the raw outcome of the real dispatch path.
+//
+// It returns the outcome rather than a summary: an earlier version guessed the
+// result from the message text and reported success for a call that had failed for
+// an unrelated reason, which is exactly the kind of helper that hides bugs.
+func (r *Runner) ToolsExecuteForTest(ctx context.Context, sess *session.Session, name, arguments string) ToolOutcome {
+	return r.tools.ExecuteOutcome(ctx, ToolInvocation{
+		SessionID: sess.ID(),
+		Session:   sess,
+		Cwd:       sess.Cwd(),
+		Name:      name,
+		CallID:    "test-call",
+		Arguments: arguments,
+	})
+}
+
+// ClearApprovalNotifier removes the page hook, so an ask fails closed with no one
+// to consult. Tests use it to exercise the no-listener path.
+func (r *Runner) ClearApprovalNotifier() {
+	r.mu.Lock()
+	r.notifyApproval = nil
 	r.mu.Unlock()
 }

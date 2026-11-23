@@ -81,6 +81,12 @@ func newFixture(t *testing.T) *fixture {
 		AgentPreset: "std-no-subagent",
 		HomeDir:     root,
 	})
+	// Mirror the production wiring: an escalation asks the page through the
+	// waterfall and delivers the answer back to the waiting call.
+	runner.SetApprovalNotifier(func(request agent.ApprovalRequest) {
+		outcome := service.RequestApprovalOverWaterfall(request)
+		runner.AnswerApproval(request.ID, outcome)
+	})
 	return &fixture{service: service, store: store, runner: runner, model: fake, root: root}
 }
 

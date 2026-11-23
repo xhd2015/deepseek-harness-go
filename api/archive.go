@@ -61,10 +61,14 @@ func openArchive(dataDir string) (*archiveStore, error) {
 }
 
 // snapshot reports the set, sorted for a stable reply.
+//
+// It never returns nil: the wire contract is an array, and `null` would make a
+// client that iterates the value crash on exactly the state a fresh install has.
 func (a *archiveStore) snapshot() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	out := append([]string(nil), a.ids...)
+	out := make([]string, 0, len(a.ids))
+	out = append(out, a.ids...)
 	sort.Strings(out)
 	return out
 }

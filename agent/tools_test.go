@@ -251,11 +251,29 @@ func TestWorkspaceWritePolicy(t *testing.T) {
 	if output, isError := callTool(t, executor, inv, "write", map[string]any{"file_path": "inside.txt", "content": "ok"}); isError {
 		t.Fatalf("inside write failed: %s", output)
 	}
-	outside := filepath.Join(t.TempDir(), "outside.txt")
+	// A temporary directory is *inside* the boundary DSH grants, so it cannot be
+	// the counter-example. The user's home is outside both the workspace and the
+	// temp roots.
+	outside := filepath.Join(userHomeForTest(t), "outside-workspace-write.txt")
 	output, isError := callTool(t, executor, inv, "write", map[string]any{"file_path": outside, "content": "no"})
-	if !isError || !strings.Contains(output, "path is outside the session workspace") {
+	if !isError || !strings.Contains(output, "[sandbox: file access denied under workspace-write mode]") {
 		t.Fatalf("outside write = %q, %v", output, isError)
 	}
+	// And a temporary path is allowed, which is the DSH boundary.
+	tempTarget := filepath.Join(t.TempDir(), "allowed.txt")
+	if output, isError := callTool(t, executor, inv, "write", map[string]any{"file_path": tempTarget, "content": "ok"}); isError {
+		t.Fatalf("a temporary path was refused: %s", output)
+	}
+}
+
+// userHomeForTest is a directory outside both the workspace and the temp roots.
+func userHomeForTest(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory to test an out-of-boundary write against")
+	}
+	return home
 }
 
 func TestBashExecutionOutputAndTimeout(t *testing.T) {

@@ -9,6 +9,8 @@ const (
 	EventApprovalAsked    = "approval/asked"
 	EventApprovalDecided  = "approval/decided"
 	EventModelSelection   = "model/selection"
+	// EventAgentPreset records a preset switch the session made after creation.
+	EventAgentPreset      = "agent/preset"
 	EventRequestHeader    = "request/header"
 	EventRequestContext   = "request/context"
 	EventTurnStart        = "turn/start"
@@ -55,6 +57,7 @@ var KnownEventTypes = map[string]bool{
 	EventApprovalAsked:    true,
 	EventApprovalDecided:  true,
 	EventModelSelection:   true,
+	EventAgentPreset:      true,
 	EventRequestHeader:    true,
 	EventRequestContext:   true,
 	EventTurnStart:        true,

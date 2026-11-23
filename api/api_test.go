@@ -1059,3 +1059,12 @@ func TestSessionAttachmentServesOnlyReferencedImages(t *testing.T) {
 		"request": map[string]any{"sessionId": "missing", "attachmentId": id},
 	}).mustFail(t, "session/not-found")
 }
+
+// nowPlus and friends give the timed waits a readable form.
+func nowPlus(seconds int) time.Time {
+	return time.Now().Add(time.Duration(seconds) * time.Second)
+}
+
+func beforeDeadline(deadline time.Time) bool { return time.Now().Before(deadline) }
+
+func sleepABit() { time.Sleep(10 * time.Millisecond) }

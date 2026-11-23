@@ -55,6 +55,13 @@ func (e *ToolExecutor) bash(ctx context.Context, inv ToolInvocation, args map[st
 		}
 	}
 
+	// The sandbox gate runs before anything is spawned: a refused command must not
+	// have had side effects. Detection is on the command text (see sandbox.go for
+	// what it can and cannot see).
+	if denial := e.bashDenial(inv, base, command, args); denial != "" {
+		return denial, true
+	}
+
 	shell, err := bashShell()
 	if err != nil {
 		return err.Error(), true

@@ -133,7 +133,7 @@ func (r *Runner) drive(ctx context.Context, sess *session.Session, turn int, rou
 			Model:           route.Model,
 			ReasoningEffort: route.ReasoningEffort,
 			Messages:        r.history(sess),
-			Tools:           r.tools.Definitions(),
+			Tools:           r.tools.toolsFor(presetIDOf(sess)),
 			SessionID:       sess.ID(),
 		}, func(chunk llm.Chunk) error {
 			return attempt.Push(chunk)
@@ -496,7 +496,7 @@ func (r *Runner) logRequestHeader(sess *session.Session, route modelconfig.Route
 			"model":           route.Model,
 			"reasoningEffort": route.ReasoningEffort,
 		},
-		"tools": r.tools.Definitions(),
+		"tools": r.tools.toolsFor(presetIDOf(sess)),
 	}
 	previous, hasPrevious := lastRequestHeader(sess.Events())
 	if hasPrevious && sameRequestHeader(previous, header) {

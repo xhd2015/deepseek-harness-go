@@ -42,7 +42,7 @@ type transcriptMessage struct {
 // message/edit records are folded before the model sees the transcript, so an
 // edit changes what the agent reads without changing any message's identity.
 func (r *Runner) history(sess *session.Session) []llm.Message {
-	messages := []llm.Message{{Role: "system", Content: r.systemPrompt()}}
+	messages := []llm.Message{{Role: "system", Content: r.systemPromptFor(sess)}}
 	sources := []int64{-1}
 	for _, event := range sess.Events() {
 		switch event.Type {
@@ -178,7 +178,44 @@ func (r *Runner) toolImages(blocks []transcriptBlock) []llm.Image {
 	return images
 }
 
-func (r *Runner) systemPrompt() string {
+// systemPromptFor builds the instructions for one session.
+//
+// A preset that names its own prompt replaces the default text entirely; a preset
+// that only narrows the tools keeps it, because the tool list is what changed.
+func (r *Runner) systemPromptFor(sess *session.Session) string {
+	if preset, ok := PresetByID(presetIDOf(sess)); ok && preset.Prompt != "" {
+		return preset.Prompt
+	}
+	return r.systemPromptForTools(sess)
+}
+
+// presetIDOf reads the preset in force for one session.
+//
+// A later switch wins over the header: the header records how the session was
+// created, and a `select` is a decision the user made since.
+func presetIDOf(sess *session.Session) string {
+	if sess == nil {
+		return DefaultPresetID
+	}
+	id := sess.Header().AgentPreset
+	for _, event := range sess.Events() {
+		if event.Type != session.EventAgentPreset {
+			continue
+		}
+		var payload struct {
+			AgentPreset string `json:"agentPreset"`
+		}
+		if json.Unmarshal(event.Data, &payload) == nil && payload.AgentPreset != "" {
+			id = payload.AgentPreset
+		}
+	}
+	if id == "" {
+		return DefaultPresetID
+	}
+	return id
+}
+
+func (r *Runner) systemPromptForTools(sess *session.Session) string {
 	prompt := r.cfg.SystemPrompt
 	if !r.tools.Enabled() {
 		return prompt

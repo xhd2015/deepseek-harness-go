@@ -66,11 +66,17 @@ type ToolExecutor struct {
 	root       string
 	permission string
 	sandbox    string
-	dshHome    string
-	enabled    bool
-	initErr    error
-	observed   observationStore
-	jobs       *jobManager
+	// approval is the session's approval policy, needed to decide whether a denial
+	// may offer an escalation the user could approve.
+	approval string
+	// askApproval runs one escalation through the approval gate. Nil means this
+	// executor cannot ask, so a widened retry fails closed instead of proceeding.
+	askApproval func(inv ToolInvocation, requested, effective, command string) ApprovalOutcome
+	dshHome     string
+	enabled     bool
+	initErr     error
+	observed    observationStore
+	jobs        *jobManager
 	// skills is the catalog this executor can load by name. It is resolved once
 	// per executor so a load does not walk the directories again.
 	skills []SkillDefinition
@@ -702,22 +708,48 @@ func withinBase(base, candidate string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-// allowMutation applies the configured file policy. Shell commands are not
-// confined by this check; only the filesystem tools are.
+// allowMutation applies the session's sandbox mode to one filesystem mutation.
+//
+// A refusal is reported in DSH's vocabulary rather than as a generic error: the
+// model has been taught to recognize `[sandbox: file access denied under <mode>
+// mode]`, and a different phrasing reads as a bug to retry rather than a policy
+// to respect.
 func (e *ToolExecutor) allowMutation(inv ToolInvocation, target, display string) error {
-	if e.permission == "read-only" || e.sandbox == "read-only" {
-		return fmt.Errorf("cannot modify %q: tools are read-only", display)
+	base, err := e.baseDir(inv)
+	if err != nil {
+		return err
 	}
-	if e.sandbox == "workspace-write" {
-		base, err := e.baseDir(inv)
-		if err != nil {
-			return err
-		}
-		if !withinBase(base, target) {
-			return fmt.Errorf("cannot modify %q: path is outside the session workspace", display)
-		}
+	if denial := writeDenial(e.policyFor(inv), base, target, display); denial != "" {
+		return fmt.Errorf("%s", strings.TrimPrefix(denial, "\n"))
 	}
 	return nil
+}
+
+// policy reads the executor's effective permission state for one call.
+func (e *ToolExecutor) policy() sandboxPolicy {
+	return sandboxPolicy{Mode: e.sandbox, Approval: e.approval}
+}
+
+// policyFor reads the permission state that applies to one invocation.
+//
+// The executor is shared by every session, so the boot configuration is only a
+// fallback: a session that switched presets must be checked against its own log,
+// or the switch would appear to work while the gate kept using the old mode.
+func (e *ToolExecutor) policyFor(inv ToolInvocation) sandboxPolicy {
+	if inv.Session != nil {
+		if state := session.FoldPermission(inv.Session.Events()); state.Recorded {
+			return sandboxPolicy{Mode: state.Sandbox, Approval: state.Approval}
+		}
+	}
+	return e.policy()
+}
+
+// SetApproval records the session's approval policy.
+func (e *ToolExecutor) SetApproval(policy string) {
+	if e == nil || policy == "" {
+		return
+	}
+	e.approval = policy
 }
 
 func (e *ToolExecutor) requireObserved(inv ToolInvocation, target, display string) error {

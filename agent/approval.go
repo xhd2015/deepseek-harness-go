@@ -1,0 +1,203 @@
+package agent
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/xhd2015/deepseek-harness-go/session"
+)
+
+// Approval is the one gate the model cannot pass on its own.
+//
+// DSH writes an `approval/asked` record, waits for an answerer, then writes the
+// matching `approval/decided`. The pair is the audit trail: a decision with no
+// question, or a question with no decision, is a log a reader cannot trust. The
+// wait happens between the two writes, which is why the ask must be inside an
+// open turn — a bare pair between turns is crash-tail garbage on reload.
+
+// ApprovalOutcome is the closed vocabulary, identical to DSH's.
+type ApprovalOutcome string
+
+const (
+	// ApprovalAllowedOnce is the only grant: one call, no standing permission.
+	ApprovalAllowedOnce ApprovalOutcome = "allowed-once"
+	ApprovalRejected    ApprovalOutcome = "rejected"
+	ApprovalCancelled   ApprovalOutcome = "cancelled"
+	// ApprovalUnavailable is the fail-closed answer when nobody can decide.
+	ApprovalUnavailable ApprovalOutcome = "unavailable"
+)
+
+// ApprovalRequest is what the page is shown.
+type ApprovalRequest struct {
+	ID       string `json:"id"`
+	Session  string `json:"sessionId"`
+	ToolName string `json:"toolName"`
+	CallID   string `json:"callId,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// approvalGate carries pending approvals between the runner and the page.
+type approvalGate struct {
+	mu      sync.Mutex
+	pending map[string]*pendingApproval
+}
+
+// pendingApproval is one question waiting for an answer.
+type pendingApproval struct {
+	request ApprovalRequest
+	answer  chan ApprovalOutcome
+}
+
+// newApprovalGate builds an empty gate.
+func newApprovalGate() *approvalGate {
+	return &approvalGate{pending: map[string]*pendingApproval{}}
+}
+
+// ask registers one question and returns the channel its answer arrives on.
+func (g *approvalGate) ask(request ApprovalRequest) chan ApprovalOutcome {
+	answer := make(chan ApprovalOutcome, 1)
+	g.mu.Lock()
+	g.pending[request.ID] = &pendingApproval{request: request, answer: answer}
+	g.mu.Unlock()
+	return answer
+}
+
+// settle delivers one answer, reporting whether the question was still open.
+func (g *approvalGate) settle(id string, outcome ApprovalOutcome) bool {
+	g.mu.Lock()
+	entry, ok := g.pending[id]
+	if ok {
+		delete(g.pending, id)
+	}
+	g.mu.Unlock()
+	if !ok {
+		return false
+	}
+	entry.answer <- outcome
+	return true
+}
+
+// PendingApprovals lists the open questions, for a page that just reconnected.
+func (r *Runner) PendingApprovals() []ApprovalRequest {
+	r.approvals.mu.Lock()
+	defer r.approvals.mu.Unlock()
+	requests := make([]ApprovalRequest, 0, len(r.approvals.pending))
+	for _, entry := range r.approvals.pending {
+		requests = append(requests, entry.request)
+	}
+	return requests
+}
+
+// AnswerApproval delivers a user's decision. It reports whether a question was
+// waiting: answering nothing must not read as success.
+func (r *Runner) AnswerApproval(id string, outcome ApprovalOutcome) bool {
+	switch outcome {
+	case ApprovalAllowedOnce, ApprovalRejected, ApprovalCancelled, ApprovalUnavailable:
+	default:
+		return false
+	}
+	return r.approvals.settle(id, outcome)
+}
+
+// requestApproval writes the audit pair around one wait.
+//
+// The `never` policy short-circuits before any wait: it is a decision the log can
+// state without asking, and pretending to ask would make the audit trail lie about
+// whether the user was consulted.
+func (r *Runner) requestApproval(sess *session.Session, requested, effective string, inv ToolInvocation, command string) ApprovalOutcome {
+	toolName := inv.Name
+	if toolName == "" {
+		toolName = "bash"
+	}
+	reason := approvalReason(command, requested, effective)
+	return r.askApproval(sess, toolName, inv.CallID, reason)
+}
+
+// askApproval writes the audit pair around one wait.
+func (r *Runner) askApproval(sess *session.Session, toolName, callID, reason string) ApprovalOutcome {
+	policy := e_policyOf(r, sess)
+	if policy.Approval == session.ApprovalNever {
+		// No prompt is shown under `never`; the log states the refusal without
+		// pretending a question was ever put to the user.
+		return ApprovalRejected
+	}
+	id := "approval-" + session.NewID()
+	if _, err := sess.Append(session.EventApprovalAsked, map[string]any{
+		"id":       id,
+		"toolName": toolName,
+		"callId":   callID,
+		"reason":   reason,
+	}); err != nil {
+		// Without the question the pair cannot be honest; fail closed.
+		return ApprovalUnavailable
+	}
+	answer := r.approvals.ask(ApprovalRequest{
+		ID: id, Session: sess.ID(), ToolName: toolName, CallID: callID, Reason: reason,
+	})
+	outcome := ApprovalUnavailable
+	request := ApprovalRequest{
+		ID: id, Session: sess.ID(), ToolName: toolName, CallID: callID, Reason: reason,
+	}
+	if r.answerer != nil {
+		outcome = r.answerer(request)
+	} else {
+		// The page decides. With no listener installed, nobody can answer, so the
+		// request fails closed immediately instead of waiting out a window that has
+		// no one on the other end.
+		if r.notifyApproval == nil {
+			outcome = ApprovalUnavailable
+		} else {
+			r.notifyApproval(request)
+			select {
+			case outcome = <-answer:
+			case <-time.After(r.approvalWait):
+				outcome = ApprovalUnavailable
+			}
+		}
+	}
+	if outcome == "" {
+		outcome = ApprovalUnavailable
+	}
+	if _, err := sess.Append(session.EventApprovalDecided, map[string]any{
+		"id":      id,
+		"outcome": string(outcome),
+	}); err != nil {
+		return ApprovalUnavailable
+	}
+	return outcome
+}
+
+// e_policyOf reads one session's folded permission state.
+func e_policyOf(r *Runner, sess *session.Session) session.PermissionState {
+	return session.FoldPermission(sess.Events())
+}
+
+// neverSentenceFor exposes the policy statement the model is shown.
+func neverSentenceFor() string { return neverSentence }
+
+// approvalReason renders the escalation a caller is asking for.
+func approvalReason(command, requested, effective string) string {
+	return fmt.Sprintf("Retry under %s (currently %s): %s", requested, effective, command)
+}
+
+// SetApprovalNotifier installs the callback that tells the page a question is
+// waiting. Without it the question is recorded and fails closed on timeout.
+func (r *Runner) SetApprovalNotifier(notify func(ApprovalRequest)) {
+	r.mu.Lock()
+	r.notifyApproval = notify
+	r.mu.Unlock()
+}
+
+// RequestApprovalForTest asks one approval by hand, for tests and diagnostics.
+func (r *Runner) RequestApprovalForTest(sess *session.Session, toolName, callID, reason string) ApprovalOutcome {
+	return r.askApproval(sess, toolName, callID, reason)
+}
+
+// SetApprovalAnswerer installs an in-process decision, used by tests and by a
+// deployment that answers approvals itself instead of through the page.
+func (r *Runner) SetApprovalAnswerer(answer func(ApprovalRequest) ApprovalOutcome) {
+	r.mu.Lock()
+	r.answerer = answer
+	r.mu.Unlock()
+}

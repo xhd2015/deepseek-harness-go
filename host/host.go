@@ -236,6 +236,15 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		},
 		Logf: logf,
 	})
+	// The page decides approvals; the runner only records and waits. Without this
+	// hook an escalation would be recorded and then fail closed on timeout, which
+	// looks to the user like a hang rather than a question.
+	var serviceRef *api.Service
+	runner.SetApprovalNotifier(func(request agent.ApprovalRequest) {
+		if serviceRef != nil {
+			serviceRef.Emit("approval/request", request)
+		}
+	})
 	service := api.New(api.Config{
 		Store:       store,
 		Runner:      runner,
@@ -262,6 +271,7 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		},
 		Logf: logf,
 	})
+	serviceRef = service
 	srv, err := server.New(server.Config{
 		Addr:     opts.listenAddr(),
 		Service:  service,

@@ -24,6 +24,7 @@ type supportedCommand struct {
 // supportedCommands lists what this backend can run.
 var supportedCommands = []supportedCommand{
 	{Name: "compact", Description: "Compact older conversation history", Argumentless: true},
+	{Name: "permission", Description: "Switch the permission preset (sandbox mode + approval policy)"},
 }
 
 // commandsList answers commands/list.
@@ -115,6 +116,30 @@ func (s *Service) commandsExecute(args json.RawMessage) (any, error) {
 		// The source event is the summary's seq: the page scrolls to it.
 		state := session.FoldCompaction(opened.Events())
 		return settle("success", "Compacted older conversation history.", state.LastEndSeq)
+	case "permission":
+		if s.cfg.Runner == nil {
+			return settle("error", "Permissions are unavailable: this backend has no runner.", 0)
+		}
+		if rawInput == "" {
+			state := session.FoldPermission(opened.Events())
+			names := make([]string, 0, len(session.PermissionPresets()))
+			for _, preset := range session.PermissionPresets() {
+				names = append(names, preset.Name)
+			}
+			return settle("success", "current preset "+state.Preset+" (available: "+strings.Join(names, ", ")+")", 0)
+		}
+		preset, ok := session.PresetNamed(rawInput)
+		if !ok {
+			names := make([]string, 0, len(session.PermissionPresets()))
+			for _, candidate := range session.PermissionPresets() {
+				names = append(names, candidate.Name)
+			}
+			return settle("error", "unknown preset \""+rawInput+"\" (available: "+strings.Join(names, ", ")+")", 0)
+		}
+		if err := applyPreset(opened, preset); err != nil {
+			return settle("error", err.Error(), 0)
+		}
+		return settle("success", "preset "+preset.Name, 0)
 	default:
 		return nil, nil
 	}

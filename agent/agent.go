@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/xhd2015/deepseek-harness-go/llm"
@@ -121,18 +122,31 @@ type Runner struct {
 	// log. The follow-up must start only after the current turn has fully unwound,
 	// because Start refuses a session that is still running.
 	pendingFollowup map[string]bool
+	// approvals carries pending escalation questions between a tool call and the
+	// page that answers it.
+	approvals *approvalGate
+	// answerer, when set, decides approvals in-process instead of waiting for the
+	// page. Nil means the page owns the decision.
+	answerer func(ApprovalRequest) ApprovalOutcome
+	// notifyApproval tells the page a question is waiting.
+	notifyApproval func(ApprovalRequest)
+	// approvalWait bounds how long a call waits for an answer before failing closed.
+	approvalWait time.Duration
 }
 
 // New builds a runner.
 func New(cfg Config) *Runner {
+	// A new session starts where DSH's web/base bundle does. Starting wider would
+	// be a drift in the unsafe direction: the user would be told nothing and a
+	// workspace-write profile would silently not apply.
 	if cfg.PermissionPreset == "" {
-		cfg.PermissionPreset = "danger-full-access"
+		cfg.PermissionPreset = session.PresetWorkspaceWrite
 	}
 	if cfg.SandboxMode == "" {
-		cfg.SandboxMode = cfg.PermissionPreset
+		cfg.SandboxMode = session.SandboxWorkspaceWrite
 	}
 	if cfg.ApprovalPolicy == "" {
-		cfg.ApprovalPolicy = "never"
+		cfg.ApprovalPolicy = session.ApprovalAsk
 	}
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = DefaultSystemPrompt
@@ -142,6 +156,18 @@ func New(cfg Config) *Runner {
 	}
 	tools := NewToolExecutor(cfg.ToolRoot)
 	tools.SetPolicy(cfg.PermissionPreset, cfg.SandboxMode)
+	tools.SetApproval(cfg.ApprovalPolicy)
+	// A widened retry is the one path that may reach outside the workspace, and it
+	// must be a user decision. The hook closes over the runner so the ask lands on
+	// the session's own log.
+	var runner *Runner
+	tools.askApproval = func(inv ToolInvocation, requested, effective, command string) ApprovalOutcome {
+		if runner == nil || inv.Session == nil {
+			// No session to record the pair on: fail closed rather than grant.
+			return ApprovalUnavailable
+		}
+		return runner.requestApproval(inv.Session, requested, effective, inv, command)
+	}
 	tools.SetDSHHome(cfg.DSHHome)
 	// Skills are resolved once per runner: a load must not walk the directories
 	// again on every tool call, and a catalog that changes mid-session would make
@@ -189,6 +215,8 @@ func New(cfg Config) *Runner {
 		cancels:         map[string]context.CancelFunc{},
 		pendingNotices:  map[string][]string{},
 		pendingFollowup: map[string]bool{},
+		approvals:       newApprovalGate(),
+		approvalWait:    5 * time.Minute,
 		waking:          map[string]bool{},
 	}
 }
@@ -305,9 +333,9 @@ func (r *Runner) ensurePreamble(sess *session.Session) error {
 		typ  string
 		data any
 	}{
-		{session.EventPermissionPreset, map[string]any{"preset": r.cfg.PermissionPreset}},
-		{session.EventSandboxMode, map[string]any{"mode": r.cfg.SandboxMode}},
-		{session.EventApprovalPolicy, map[string]any{"policy": r.cfg.ApprovalPolicy}},
+		{session.EventPermissionPreset, map[string]any{"preset": session.DefaultPermission().Preset}},
+		{session.EventSandboxMode, map[string]any{"mode": session.DefaultPermission().Sandbox}},
+		{session.EventApprovalPolicy, map[string]any{"policy": session.DefaultPermission().Approval}},
 	}
 	for _, step := range steps {
 		if seen[step.typ] {

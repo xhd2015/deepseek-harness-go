@@ -220,6 +220,32 @@ func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 		return s.compactIntoNew(args)
 	case "session/setThinkingCapAutoContinue":
 		return s.setThinkingCapAutoContinue(args)
+	case "permissionPresets/catalog":
+		return s.permissionPresetsCatalog(args)
+	case "permissionPresets/set":
+		return s.permissionPresetsSet(args)
+	case "approval/answer":
+		return s.answerApproval(args)
+	case "approval/pending":
+		return s.pendingApprovals(args)
+	case "agentPresets/list":
+		return s.agentPresetsList(args)
+	case "agentPresets/read":
+		return s.agentPresetsRead(args)
+	case "agentPresets/select":
+		return s.agentPresetsSelect(args)
+	case "pluginManager/listBundles":
+		return s.pluginManagerListBundles(args)
+	case "pluginManager/listPlugins":
+		return s.pluginManagerListPlugins(args)
+	case "pluginManager/registries":
+		return s.pluginManagerRegistries(args)
+	case "pluginManager/installBundle", "pluginManager/updateBundle",
+		"pluginManager/setBundleEnabled", "pluginManager/setPluginEnabled",
+		"pluginManager/removeBundle", "pluginManager/inspect",
+		"pluginManager/listVersions", "pluginManager/readBundleDetail",
+		"pluginManager/listVersionExemptions", "pluginManager/setVersionExemption":
+		return s.pluginManagerRefuse(args)
 	case "commands/list":
 		return s.commandsList(args)
 	case "commands/execute":

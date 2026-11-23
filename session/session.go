@@ -129,7 +129,26 @@ func (s *Session) Path() string { return s.path }
 func (s *Session) Header() Header { return s.header }
 
 // Cwd returns the session working directory.
-func (s *Session) Cwd() string { return s.header.Cwd }
+// Cwd reports the directory this session's calls resolve against: the newest
+// recorded change, or the header's when the model never moved it.
+func (s *Session) Cwd() string {
+	s.mu.Lock()
+	events := make([]Event, len(s.events))
+	copy(events, s.events)
+	s.mu.Unlock()
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type != EventWorkingDirectory {
+			continue
+		}
+		var payload struct {
+			Cwd string `json:"cwd"`
+		}
+		if json.Unmarshal(events[i].Data, &payload) == nil && payload.Cwd != "" {
+			return payload.Cwd
+		}
+	}
+	return s.header.Cwd
+}
 
 // Writable reports whether this handle owns the write lease.
 func (s *Session) Writable() bool { return s.writable }

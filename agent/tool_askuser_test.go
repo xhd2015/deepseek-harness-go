@@ -3,92 +3,103 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"testing"
 	"time"
 )
 
-func TestAskUserQuestionBlocksThenReturnsAnswers(t *testing.T) {
-	e := NewToolExecutor(t.TempDir())
-	inv := ToolInvocation{SessionID: "session-test", CallID: "call-1", Name: askUserQuestionToolName,
-		Arguments: `{"questions":[{"id":"q1","question":"Which mode?","header":"Choose","options":[{"label":"embed"},{"label":"standalone","description":"separate process"}],"multi_select":false}]}`}
+// timeoutSecond is one second, named so the deadline assertions read as budgets
+// rather than magic numbers.
+const timeoutSecond = time.Second
 
-	type result struct{ out ToolOutcome }
-	done := make(chan result, 1)
-	go func() { done <- result{e.ExecuteOutcome(context.Background(), inv)} }()
+// TestAskUserQuestionReturnsImmediately is the corrected contract: asking is an
+// ordinary tool call. It must not wait for a person, because nobody answers in
+// seconds and a waiting call leaves the whole session looking busy.
+func TestAskUserQuestionReturnsImmediately(t *testing.T) {
+	executor := NewToolExecutor(t.TempDir())
+	inv := ToolInvocation{
+		SessionID: "session-fast",
+		CallID:    "call-fast",
+		Name:      askUserQuestionToolName,
+		Arguments: `{"questions":[{"id":"q1","question":"Which mode?","options":[{"label":"embed"}]}]}`,
+	}
+	done := make(chan ToolOutcome, 1)
+	go func() { done <- executor.ExecuteOutcome(context.Background(), inv) }()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for len(PendingQuestions()) == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if len(PendingQuestions()) != 1 {
-		t.Fatalf("pending = %v", PendingQuestions())
-	}
-	if _, err := AnswerQuestion("session-test", "call-1", QuestionAnswerBatch{Answers: []QuestionAnswer{{ID: "q1", Selected: []string{"standalone"}}}}); err != nil {
-		t.Fatalf("answer: %v", err)
-	}
 	select {
-	case r := <-done:
-		if r.out.IsError {
-			t.Fatalf("error: %s", r.out.Text)
+	case outcome := <-done:
+		if outcome.IsError {
+			t.Fatalf("asking failed: %s", outcome.Text)
 		}
-		var got QuestionAnswerBatch
-		if err := json.Unmarshal([]byte(r.out.Text), &got); err != nil {
-			t.Fatalf("decode %s: %v", r.out.Text, err)
+		var asked AskedQuestionResult
+		if err := json.Unmarshal([]byte(outcome.Text), &asked); err != nil {
+			t.Fatalf("decode %q: %v", outcome.Text, err)
 		}
-		if len(got.Answers) != 1 || got.Answers[0].Selected[0] != "standalone" {
-			t.Fatalf("answers = %+v", got)
+		if !asked.Asked || asked.CallID != "call-fast" || asked.Message == "" {
+			t.Fatalf("result = %+v", asked)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("tool did not return after the answer")
+	case <-time.After(2 * timeoutSecond):
+		t.Fatal("ask_user_question waited for an answer instead of returning")
 	}
-	if len(PendingQuestions()) != 0 {
-		t.Fatalf("still pending: %v", PendingQuestions())
+
+	// The question is remembered so a later answer can be validated.
+	if pending := PendingQuestions(); len(pending) != 1 {
+		t.Fatalf("pending = %v", pending)
 	}
 }
 
-func TestAskUserQuestionReleasesOnCancel(t *testing.T) {
-	e := NewToolExecutor(t.TempDir())
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan ToolOutcome, 1)
-	go func() {
-		done <- e.ExecuteOutcome(ctx, ToolInvocation{SessionID: "s2", CallID: "c2", Name: askUserQuestionToolName,
-			Arguments: `{"questions":[{"id":"q","question":"hi"}]}`})
-	}()
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-	select {
-	case out := <-done:
-		if !out.IsError || !strings.Contains(out.Text, "turn ended") {
-			t.Fatalf("outcome = %+v", out)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("cancel did not release the tool")
-	}
-	if len(PendingQuestions()) != 0 {
-		t.Fatalf("leaked: %v", PendingQuestions())
-	}
-}
+// TestAnswerQuestionValidatesTheBatch keeps a malformed reply from reaching the
+// model, where it would be indistinguishable from a real answer.
+func TestAnswerQuestionValidatesTheBatch(t *testing.T) {
+	executor := NewToolExecutor(t.TempDir())
+	executor.ExecuteOutcome(context.Background(), ToolInvocation{
+		SessionID: "session-batch",
+		CallID:    "call-batch",
+		Name:      askUserQuestionToolName,
+		Arguments: `{"questions":[{"id":"a","question":"A"},{"id":"b","question":"B"}]}`,
+	})
 
-func TestAnswerQuestionRejectsBadBatches(t *testing.T) {
-	e := NewToolExecutor(t.TempDir())
-	done := make(chan ToolOutcome, 1)
-	go func() {
-		done <- e.ExecuteOutcome(context.Background(), ToolInvocation{SessionID: "s3", CallID: "c3", Name: askUserQuestionToolName,
-			Arguments: `{"questions":[{"id":"a","question":"A"},{"id":"b","question":"B"}]}`})
-	}()
-	time.Sleep(100 * time.Millisecond)
-	if _, err := AnswerQuestion("s3", "c3", QuestionAnswerBatch{Answers: []QuestionAnswer{{ID: "a"}}}); err != ErrIncompleteAnswers {
+	if err := AnswerQuestion("session-batch", "call-batch", QuestionAnswerBatch{
+		Answers: []QuestionAnswer{{ID: "a"}},
+	}); err != ErrIncompleteAnswers {
 		t.Fatalf("partial batch err = %v", err)
 	}
-	if _, err := AnswerQuestion("s3", "c3", QuestionAnswerBatch{Answers: []QuestionAnswer{{ID: "a"}, {ID: "a"}}}); err != ErrIncompleteAnswers {
+	if err := AnswerQuestion("session-batch", "call-batch", QuestionAnswerBatch{
+		Answers: []QuestionAnswer{{ID: "a"}, {ID: "a"}},
+	}); err != ErrIncompleteAnswers {
 		t.Fatalf("duplicate err = %v", err)
 	}
-	if _, err := AnswerQuestion("s3", "c3", QuestionAnswerBatch{Answers: []QuestionAnswer{{ID: "a"}, {ID: "b"}}}); err != nil {
-		t.Fatalf("good batch: %v", err)
+	if err := AnswerQuestion("session-batch", "call-batch", QuestionAnswerBatch{
+		Answers: []QuestionAnswer{{ID: "a"}, {ID: "b"}},
+	}); err != nil {
+		t.Fatalf("valid batch: %v", err)
 	}
-	<-done
-	if _, err := AnswerQuestion("s3", "c3", QuestionAnswerBatch{Answers: []QuestionAnswer{{ID: "a"}, {ID: "b"}}}); err != ErrNoSuchQuestion {
+	// An answered question is gone, so a second submit cannot reach the model twice.
+	if err := AnswerQuestion("session-batch", "call-batch", QuestionAnswerBatch{
+		Answers: []QuestionAnswer{{ID: "a"}, {ID: "b"}},
+	}); err != ErrNoSuchQuestion {
 		t.Fatalf("second answer err = %v", err)
+	}
+}
+
+// TestAskUserQuestionRejectsBadQuestions reports the model's mistake instead of
+// showing the user a card that cannot be answered.
+func TestAskUserQuestionRejectsBadQuestions(t *testing.T) {
+	executor := NewToolExecutor(t.TempDir())
+	cases := map[string]string{
+		"no questions":  `{}`,
+		"empty list":    `{"questions":[]}`,
+		"missing id":    `{"questions":[{"question":"Q"}]}`,
+		"missing text":  `{"questions":[{"id":"a"}]}`,
+		"duplicate ids": `{"questions":[{"id":"a","question":"A"},{"id":"a","question":"B"}]}`,
+	}
+	for name, arguments := range cases {
+		t.Run(name, func(t *testing.T) {
+			outcome := executor.ExecuteOutcome(context.Background(), ToolInvocation{
+				SessionID: "session-bad", CallID: "call-bad", Name: askUserQuestionToolName, Arguments: arguments,
+			})
+			if !outcome.IsError {
+				t.Fatalf("accepted %s: %s", arguments, outcome.Text)
+			}
+		})
 	}
 }

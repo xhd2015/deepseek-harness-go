@@ -176,7 +176,7 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 					},
 					"timeoutMs": map[string]any{
 						"type":        "number",
-						"description": "Timeout in milliseconds. The executor applies its configured default and cap, and kills the command on expiry.",
+						"description": "Timeout in milliseconds. The executor applies its configured default and cap; on expiry the command moves to the background as a job instead of being killed.",
 					},
 					"workdir": map[string]any{
 						"type":        "string",
@@ -186,14 +186,36 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 						"type":        "boolean",
 						"description": "Run in the background and return a job id immediately (collect with job_output, stop with job_kill). No timeout applies.",
 					},
+					"sandbox_permissions": map[string]any{
+						"type":        "string",
+						"description": "The narrowest wider sandbox mode for a one-shot retry of the exact command the sandbox just denied; the retry asks the user for approval.",
+						"enum":        []string{"workspace-write", "danger-full-access"},
+					},
+					"justification": map[string]any{
+						"type":        "string",
+						"description": "Required with sandbox_permissions: one sentence for the user explaining why this exact command needs the wider access. Use the language of the user’s current request.",
+					},
 				},
 				"required": []string{"description", "command"},
 			},
 		},
 		{
+			Name:        workingDirectoryToolName,
+			Description: workingDirectoryDescription,
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"cd": map[string]any{
+						"type":        "string",
+						"description": "Existing directory to enter. Omit to read the current directory.",
+					},
+				},
+			},
+		},
+		{
 			Name:        askUserQuestionToolName,
 			Description: askUserQuestionDescription,
-			Parameters:  askUserQuestionParametersWithWait(),
+			Parameters:  askUserQuestionParameters(),
 		},
 		{
 			Name:        "read",
@@ -216,6 +238,15 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 				"properties": map[string]any{
 					"file_path": map[string]any{"type": "string", "description": "Path to write, resolved by the filesystem backend. Provide `file_path` before `content` in the arguments."},
 					"content":   map[string]any{"type": "string", "description": "Full UTF-8 text content to write."},
+					"sandbox_permissions": map[string]any{
+						"type":        "string",
+						"description": "The narrowest wider sandbox mode for a one-shot retry of the exact operation the sandbox just denied; the retry asks the user for approval.",
+						"enum":        []string{"workspace-write", "danger-full-access"},
+					},
+					"justification": map[string]any{
+						"type":        "string",
+						"description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access. Use the language of the user’s current request.",
+					},
 				},
 				"required": []string{"file_path", "content"},
 			},
@@ -230,6 +261,15 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 					"old_string":  map[string]any{"type": "string", "description": "Literal text to replace."},
 					"new_string":  map[string]any{"type": "string", "description": "Literal replacement text. Use an empty string to delete the match."},
 					"replace_all": map[string]any{"type": "boolean", "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once."},
+					"sandbox_permissions": map[string]any{
+						"type":        "string",
+						"description": "The narrowest wider sandbox mode for a one-shot retry of the exact operation the sandbox just denied; the retry asks the user for approval.",
+						"enum":        []string{"workspace-write", "danger-full-access"},
+					},
+					"justification": map[string]any{
+						"type":        "string",
+						"description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access. Use the language of the user’s current request.",
+					},
 				},
 				"required": []string{"file_path", "old_string", "new_string"},
 			},
@@ -321,7 +361,7 @@ func (e *ToolExecutor) Definitions() []llm.ToolDef {
 				"properties": map[string]any{
 					"queries": map[string]any{
 						"type":        "array",
-						"description": "1–4 search queries; their results are merged.",
+						"description": "1–10 search queries; their results are merged.",
 						"items":       map[string]any{"type": "string"},
 					},
 				},
@@ -397,6 +437,8 @@ func (e *ToolExecutor) ExecuteOutcome(ctx context.Context, inv ToolInvocation) T
 		return ToolOutcome{Text: text, IsError: failed}
 	case askUserQuestionToolName:
 		return e.askUserQuestion(ctx, inv, args)
+	case workingDirectoryToolName:
+		return e.workingDirectory(ctx, inv, args)
 	case "todo_write":
 		return e.todoWrite(inv, args)
 	case "job_output":

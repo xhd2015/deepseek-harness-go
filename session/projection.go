@@ -45,6 +45,9 @@ func Baseline(header Header, events []Event) ProjectionBaseline {
 		"next":     next,
 	}
 	values["todos"] = todosProjection(events)
+	// The question card is rendered from this face, so a backend that records an
+	// ask without folding it leaves the user with a question they cannot answer.
+	values[QuestionProjectionKey] = userQuestionsProjection(events)
 	return ProjectionBaseline{AsOfSeq: asOfSeq, Values: values}
 }
 

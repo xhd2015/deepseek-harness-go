@@ -12,16 +12,11 @@ import (
 
 // answerQuestion answers an ask_user_question call.
 //
-// Two shapes, because the question has two lives. While the call is still inside
-// its wait window the answer becomes that call's tool result and nothing else is
-// written — that is what a real DSH session holds. Once the window has expired the
-// call has already returned a pending result, so the only way the model can learn
-// the answer is a user message that continues the turn; DSH records that message
-// with a `user-question-reply` source naming the call.
-//
-// Writing the message in the answered case would show a reply DSH never writes;
-// omitting it in the pending case would swallow the answer after the user took the
-// trouble to give it.
+// The call that asked has already returned, so the answer cannot be its tool
+// result: the model learns it from a user message that continues the turn. DSH
+// records that message with a `user-question-reply` source naming the call, which
+// is also what lets the page show who answered what instead of a message the
+// person appears to have typed unprompted.
 func (s *Service) answerQuestion(args json.RawMessage) (any, error) {
 	var request struct {
 		SessionID string `json:"sessionId"`
@@ -66,14 +61,11 @@ func (s *Service) answerQuestion(args json.RawMessage) (any, error) {
 		})
 	}
 
-	delivered, err := agent.AnswerQuestion(sessionID, callID, batch)
-	if err != nil {
+	if err := agent.AnswerQuestion(sessionID, callID, batch); err != nil {
 		return nil, fail(CodeBusy, err.Error())
 	}
-	if delivered {
-		return true, nil
-	}
-	// The window had expired: continue the turn with the person's answer.
+	// The call returned as soon as the question was recorded, so the answer is
+	// always a late one: it becomes a message that continues the conversation.
 	if err := s.continueWithAnswer(sessionID, callID, batch); err != nil {
 		return nil, err
 	}

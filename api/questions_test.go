@@ -73,16 +73,22 @@ func newAskFixture(t *testing.T, question string) *fixture {
 // waitForPendingQuestion waits until the ask is registered, without sleeping a
 // fixed amount: the turn is asynchronous, and a fixed sleep would make this test
 // report the machine's load instead of the code's behaviour.
-func waitForPendingQuestion(t *testing.T) string {
+func waitForPendingQuestion(t *testing.T, sessionID string) string {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if pending := agent.PendingQuestions(); len(pending) == 1 {
-			return pending[0]
+		var mine []string
+		for _, key := range agent.PendingQuestions() {
+			if strings.HasPrefix(key, sessionID+"\x00") {
+				mine = append(mine, key)
+			}
+		}
+		if len(mine) == 1 {
+			return mine[0]
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("no question became pending: %v", agent.PendingQuestions())
+	t.Fatalf("no question became pending for %s: %v", sessionID, agent.PendingQuestions())
 	return ""
 }
 
@@ -96,9 +102,10 @@ func TestAskUserQuestionRoundTrip(t *testing.T) {
 	opened := f.createSession(t)
 
 	// session/prompt answers as soon as the turn starts, so the turn's own end is
-	// what this test waits on.
+	// what this test waits on — and it must arrive without an answer.
 	promptTurn(t, f, opened, "set up the service")
-	waitForPendingQuestion(t)
+	waitForTurnEnd(t, opened, 10*time.Second)
+	waitForPendingQuestion(t, opened.ID())
 
 	answered := f.invoke(t, "userQuestions/answer", map[string]any{
 		"sessionId": opened.ID(),
@@ -112,7 +119,6 @@ func TestAskUserQuestionRoundTrip(t *testing.T) {
 		},
 	})
 	answered.mustSucceed(t)
-
 	waitForTurnEnd(t, opened, 10*time.Second)
 
 	// The turn ran to a normal end, which is what "继续 turn" means.
@@ -120,27 +126,49 @@ func TestAskUserQuestionRoundTrip(t *testing.T) {
 		t.Fatalf("turn ended as %q, want %q", end, session.TurnCompleted)
 	}
 
-	// The record is isomorphic to DSH: the call, the person's reply naming it, and
-	// the result carrying the batch.
+	// The record is isomorphic to DSH: the call, a result saying what happened, and
+	// the person's later reply carrying the batch.
 	call := findEvent(t, opened, session.EventToolCall)
 	if !strings.Contains(string(call.Data), `"name":"ask_user_question"`) {
 		t.Fatalf("tool call = %s", call.Data)
 	}
-	// A real DSH session records the answer in the tool result and nowhere else:
-	// the turn never ended, so there is no user message to write. Asserting the
-	// absence keeps this backend from growing a record Node DSH would not have.
-	if reply := findQuestionReply(t, opened); reply != nil {
-		t.Fatalf("the answer was recorded as a user message DSH does not write: %s", reply.Data)
+	resultText, resultError := toolResultText(t, findEvent(t, opened, session.EventToolResult))
+	if resultError {
+		t.Fatalf("asking was recorded as a failure: %s", resultText)
 	}
-	result := findEvent(t, opened, session.EventToolResult)
-	if !strings.Contains(string(result.Data), `"callId":"call-ask"`) {
-		t.Fatalf("tool result does not answer the call: %s", result.Data)
+	var asked agent.AskedQuestionResult
+	if err := json.Unmarshal([]byte(resultText), &asked); err != nil {
+		t.Fatalf("decode ask result %q: %v", resultText, err)
 	}
-	if !strings.Contains(string(result.Data), `"selected":["standalone"]`) {
-		t.Fatalf("tool result lost the selection: %s", result.Data)
+	if !asked.Asked || asked.CallID != "call-ask" {
+		t.Fatalf("the call did not report that it asked: %+v", asked)
 	}
-	if !strings.Contains(string(result.Data), `"custom":"and keep the data dir"`) {
-		t.Fatalf("tool result lost the custom text: %s", result.Data)
+	// The answer arrives after the call returned, so it is recorded as the message
+	// DSH writes for a late reply — and it starts the turn that reads it.
+	reply := findQuestionReply(t, opened)
+	if reply == nil {
+		t.Fatal("the answer was not recorded as a late reply message")
+	}
+	var replyPayload struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(reply.Data, &replyPayload); err != nil || len(replyPayload.Content) == 0 {
+		t.Fatalf("decode reply: %v %s", err, reply.Data)
+	}
+	var carried struct {
+		Answers []agent.QuestionAnswer `json:"answers"`
+	}
+	if err := json.Unmarshal([]byte(replyPayload.Content[0].Text), &carried); err != nil {
+		t.Fatalf("decode reply payload %q: %v", replyPayload.Content[0].Text, err)
+	}
+	if len(carried.Answers) != 1 || len(carried.Answers[0].Selected) != 1 ||
+		carried.Answers[0].Selected[0] != "standalone" {
+		t.Fatalf("the reply lost the selection: %+v", carried.Answers)
+	}
+	if carried.Answers[0].Custom != "and keep the data dir" {
+		t.Fatalf("the reply lost the custom text: %+v", carried.Answers[0])
 	}
 }
 
@@ -152,7 +180,7 @@ func TestAskUserQuestionCannotBeAnsweredTwice(t *testing.T) {
 	opened := f.createSession(t)
 
 	promptTurn(t, f, opened, "go")
-	waitForPendingQuestion(t)
+	waitForPendingQuestion(t, opened.ID())
 
 	args := map[string]any{
 		"sessionId": opened.ID(),
@@ -218,19 +246,46 @@ func promptTurn(t *testing.T, f *fixture, opened *session.Session, text string) 
 	}).mustSucceed(t)
 }
 
-// waitForTurnEnd blocks until the session records another turn/end.
-func waitForTurnEnd(t *testing.T, opened *session.Session, budget time.Duration) {
+// waitForTurnEnd blocks until the session has recorded at least `want` turn ends.
+//
+// Counting rather than "any turn end" is what lets a test tell the turn that asked
+// the question from the turn the answer started: both end the same way, and only
+// the count says which one arrived.
+func waitForTurnEnd(t *testing.T, opened *session.Session, budget time.Duration) int {
 	t.Helper()
 	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
-		for _, event := range opened.Events() {
-			if event.Type == session.EventTurnEnd {
-				return
-			}
+		if ends := countTurnEnds(opened); ends > 0 {
+			return ends
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("the turn never ended")
+	return 0
+}
+
+// waitForTurnEnds blocks until the session has recorded `want` turn ends.
+func waitForTurnEnds(t *testing.T, opened *session.Session, want int, budget time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if countTurnEnds(opened) >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("only %d turn ends were recorded, want %d", countTurnEnds(opened), want)
+}
+
+// countTurnEnds reports how many turns this session has closed.
+func countTurnEnds(opened *session.Session) int {
+	total := 0
+	for _, event := range opened.Events() {
+		if event.Type == session.EventTurnEnd {
+			total++
+		}
+	}
+	return total
 }
 
 // lastTurnEnd reports how the session's last turn ended.
@@ -282,40 +337,53 @@ func findQuestionReply(t *testing.T, opened *session.Session) *session.Event {
 	return nil
 }
 
-// TestAskUserQuestionWindowExpiresThenLateAnswerContinues pins the second shape:
-// a question nobody answered in time must not hold the turn, and the answer that
-// arrives afterwards must still reach the model.
-//
-// This is also what makes the question answerable from a page: the session page's
-// question projection only tracks calls whose schema declares a wait window, so a
-// call without one would never surface an answerable card.
-func TestAskUserQuestionWindowExpiresThenLateAnswerContinues(t *testing.T) {
-	// A one-second window keeps the test honest without a long sleep.
-	question := `{"timeout":1,"questions":[{"id":"q","question":"Ship it?","options":[{"label":"yes"},{"label":"no"}]}]}`
+// TestAskUserQuestionDoesNotHoldTheTurn is the corrected requirement: asking must
+// not keep the session running. A person may answer in a minute or a day, and a
+// backend that waits for them leaves the board showing a live turn that is doing
+// nothing.
+func TestAskUserQuestionDoesNotHoldTheTurn(t *testing.T) {
+	question := `{"questions":[{"id":"q","question":"Ship it?","options":[{"label":"yes"},{"label":"no"}]}]}`
 	f := newAskFixture(t, question)
 	opened := f.createSession(t)
 
 	promptTurn(t, f, opened, "ask me")
-	waitForPendingQuestion(t)
+	waitForTurnEnd(t, opened, 5*time.Second)
 
-	// The first turn must end on its own, with the pending result recorded.
-	waitForTurnEnd(t, opened, 10*time.Second)
+	// The session is free again: no turn is running while the question stands.
+	// A busy session after turn/end means the turn never really closed.
+	if opened.Busy() {
+		t.Fatal("the session is still busy after the ask turn ended")
+	}
+	if f.runner.Busy(opened.ID()) {
+		t.Fatal("the runner still reports a live turn after the ask turn ended")
+	}
+
+	// The result says the question was asked, not that it was answered or skipped.
 	result := findEvent(t, opened, session.EventToolResult)
 	text, isError := toolResultText(t, result)
 	if isError {
-		// A pending result is not a failure: the model must continue, not retry.
-		t.Fatalf("a pending question was recorded as an error: %s", text)
+		t.Fatalf("asking was recorded as a failure: %s", text)
 	}
-	var pending agent.PendingQuestionResult
-	if err := json.Unmarshal([]byte(text), &pending); err != nil {
-		t.Fatalf("decode pending result %q: %v", text, err)
+	var asked agent.AskedQuestionResult
+	if err := json.Unmarshal([]byte(text), &asked); err != nil {
+		t.Fatalf("decode ask result %q: %v", text, err)
 	}
-	if !pending.Pending || pending.CallID != "call-ask" || pending.Message == "" {
-		t.Fatalf("pending result = %+v", pending)
+	if !asked.Asked || asked.CallID != "call-ask" || asked.Message == "" {
+		t.Fatalf("ask result = %+v", asked)
 	}
+}
 
-	// The ask is still answerable, so the late answer becomes a message and runs
-	// the turn that reads it.
+// TestAskUserQuestionAnsweredLongAfterTheTurn proves the answer is still accepted
+// once the turn is long gone, and that it starts a new turn which reads it.
+func TestAskUserQuestionAnsweredLongAfterTheTurn(t *testing.T) {
+	question := `{"questions":[{"id":"q","question":"Ship it?","options":[{"label":"yes"}]}]}`
+	f := newAskFixture(t, question)
+	opened := f.createSession(t)
+
+	promptTurn(t, f, opened, "ask me")
+	waitForTurnEnd(t, opened, 5*time.Second)
+	waitForPendingQuestion(t, opened.ID())
+
 	f.invoke(t, "userQuestions/answer", map[string]any{
 		"sessionId": opened.ID(),
 		"callId":    "call-ask",
@@ -323,20 +391,16 @@ func TestAskUserQuestionWindowExpiresThenLateAnswerContinues(t *testing.T) {
 	}).mustSucceed(t)
 
 	reply := waitForQuestionReply(t, opened, 5*time.Second)
-	if !strings.Contains(string(reply.Data), `"kind":"user-question-reply"`) {
+	if !strings.Contains(string(reply.Data), `"kind":"user-question-reply"`) ||
+		!strings.Contains(string(reply.Data), `"callId":"call-ask"`) ||
+		!strings.Contains(string(reply.Data), `"outcome":"answered"`) {
 		t.Fatalf("late answer source = %s", reply.Data)
-	}
-	if !strings.Contains(string(reply.Data), `"callId":"call-ask"`) {
-		t.Fatalf("late answer lost its call id: %s", reply.Data)
-	}
-	if !strings.Contains(string(reply.Data), `"outcome":"answered"`) {
-		t.Fatalf("late answer outcome = %s", reply.Data)
 	}
 	if !strings.Contains(string(reply.Data), "answer_to_pending_question") {
 		t.Fatalf("late answer payload = %s", reply.Data)
 	}
-	// And the turn it started reached a normal end.
-	waitForTurnEnd(t, opened, 10*time.Second)
+	// The reply starts a second turn, which must end normally too.
+	waitForTurnEnds(t, opened, 2, 10*time.Second)
 }
 
 // toolResultText returns a tool result's text and failure flag.
@@ -371,4 +435,66 @@ func waitForQuestionReply(t *testing.T, opened *session.Session, budget time.Dur
 	}
 	t.Fatal("the late answer was never recorded as a message")
 	return nil
+}
+
+// TestQuestionAppearsInTheServedProjection is the page's own path.
+//
+// The browser renders the question card from session/projections, not from the
+// event log, so the contract is what that endpoint answers: an ask whose call has
+// returned must be listed as a continued question. A backend that folds the log
+// correctly but omits the face leaves the user with no way to answer.
+func TestQuestionAppearsInTheServedProjection(t *testing.T) {
+	question := `{"questions":[{"id":"color","question":"Which color?","header":"Pick one",` +
+		`"options":[{"label":"Blue","description":"calm"},{"label":"Green"}],"multi_select":true}]}`
+	f := newAskFixture(t, question)
+	opened := f.createSession(t)
+
+	promptTurn(t, f, opened, "ask me")
+	waitForTurnEnd(t, opened, 5*time.Second)
+
+	value := f.invoke(t, "session/projections", map[string]any{
+		"request": map[string]any{"sessionId": opened.ID()},
+	}).mustSucceed(t)
+	var payload struct {
+		Values map[string]json.RawMessage `json:"values"`
+	}
+	if err := json.Unmarshal(value, &payload); err != nil {
+		t.Fatalf("decode projections: %v", err)
+	}
+	raw, ok := payload.Values["userQuestions"]
+	if !ok {
+		t.Fatal("the served projections have no userQuestions face")
+	}
+	var face struct {
+		Active []struct {
+			CallID    string `json:"callId"`
+			State     string `json:"state"`
+			Questions []struct {
+				ID          string `json:"id"`
+				Question    string `json:"question"`
+				Header      string `json:"header"`
+				MultiSelect bool   `json:"multiSelect"`
+				Options     []struct {
+					Label       string `json:"label"`
+					Description string `json:"description"`
+				} `json:"options"`
+			} `json:"questions"`
+		} `json:"active"`
+	}
+	if err := json.Unmarshal(raw, &face); err != nil {
+		t.Fatalf("decode face %s: %v", raw, err)
+	}
+	if len(face.Active) != 1 {
+		t.Fatalf("active = %s, want the one open question", raw)
+	}
+	entry := face.Active[0]
+	if entry.CallID != "call-ask" || entry.State != "continued" {
+		t.Fatalf("active entry = %+v", entry)
+	}
+	if len(entry.Questions) != 1 || entry.Questions[0].ID != "color" || !entry.Questions[0].MultiSelect {
+		t.Fatalf("questions = %+v", entry.Questions)
+	}
+	if len(entry.Questions[0].Options) != 2 || entry.Questions[0].Options[0].Description != "calm" {
+		t.Fatalf("options = %+v", entry.Questions[0].Options)
+	}
 }

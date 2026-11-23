@@ -52,7 +52,17 @@ type dshQuestionRecord struct {
 		CallID    string `json:"callId"`
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
-		Message   struct {
+		// Source is where a user/message names the call it replies to; a tool
+		// result carries the same link under its message instead.
+		Source struct {
+			Kind   string `json:"kind"`
+			CallID string `json:"callId"`
+		} `json:"source"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		Message struct {
 			Role       string `json:"role"`
 			ToolCallID string `json:"toolCallId"`
 			IsError    bool   `json:"isError"`
@@ -103,14 +113,15 @@ func readDSHQuestionRecords(t *testing.T, root string) (call, result dshQuestion
 	return call, result
 }
 
-// TestQuestionRecordMatchesRealDSH compares this backend's record of an ask round
-// against one Node DSH wrote, field by field.
+// TestQuestionCallMatchesRealDSH compares this backend's record of an ask against
+// one Node DSH wrote.
 //
-// Three things must line up or the two backends cannot read each other's logs:
-// the event type names, the call identity the result is keyed by, and the answer
-// batch inside the result text — including the option structure, since the UI
-// renders the card from the call's arguments and the reply from the batch.
-func TestQuestionRecordMatchesRealDSH(t *testing.T) {
+// What must line up is the call and the answer vocabulary: the event types, the
+// name, the call identity the reply is keyed by, and the shape of each answer
+// object. The envelope around the answers is deliberately not compared: this
+// backend records the answer after the call returned, as the late reply DSH
+// defines, while the fixture answered while the call was still open.
+func TestQuestionCallMatchesRealDSH(t *testing.T) {
 	root := dshSnapshotRoot()
 	if root == "" {
 		t.Skip("no DeepSeek Harness checkout with the question snapshot; set DSH_GO_DSH_ROOT")
@@ -137,11 +148,12 @@ func TestQuestionRecordMatchesRealDSH(t *testing.T) {
 		t.Fatal("the DSH fixture has no questions")
 	}
 	// Replaying the fixture's own arguments is the strictest form of "the schemas
-	// agree": if a field name differed, the ask would arrive without it.
+	// agree": if a field name differed, the question would arrive without it.
 	f := newAskFixture(t, dshCall.Data.Arguments)
 	opened := f.createSession(t)
 	promptTurn(t, f, opened, "ask me")
-	pending := waitForPendingQuestion(t)
+	waitForTurnEnd(t, opened, 5*time.Second)
+	waitForPendingQuestion(t, opened.ID())
 
 	// The call this backend wrote must carry the same shape as DSH's.
 	call := findEvent(t, opened, session.EventToolCall)
@@ -155,8 +167,11 @@ func TestQuestionRecordMatchesRealDSH(t *testing.T) {
 	if wroteCall.Data.Name != dshCall.Data.Name {
 		t.Fatalf("tool name = %q, want %q", wroteCall.Data.Name, dshCall.Data.Name)
 	}
+	if wroteCall.Data.Arguments != dshCall.Data.Arguments {
+		t.Fatalf("arguments were rewritten\n got: %s\nwant: %s", wroteCall.Data.Arguments, dshCall.Data.Arguments)
+	}
 
-	// Answer with a selection and custom text, exactly as the DSH session did.
+	// Answer with the same batch the DSH session recorded.
 	var answered struct {
 		Answers []struct {
 			ID       string   `json:"id"`
@@ -170,8 +185,6 @@ func TestQuestionRecordMatchesRealDSH(t *testing.T) {
 	if len(answered.Answers) == 0 {
 		t.Fatal("the DSH fixture recorded no answers")
 	}
-	// The id in the batch must be the id from the question, or the browser and the
-	// model would disagree about which answer belongs where.
 	if answered.Answers[0].ID != fixtureArgs.Questions[0].ID {
 		t.Fatalf("DSH answer id %q does not match its question %q",
 			answered.Answers[0].ID, fixtureArgs.Questions[0].ID)
@@ -184,45 +197,38 @@ func TestQuestionRecordMatchesRealDSH(t *testing.T) {
 	}
 	f.invoke(t, "userQuestions/answer", map[string]any{
 		"sessionId": opened.ID(),
-		"callId":    strings.SplitN(pending, "\x00", 2)[1],
+		"callId":    strings.SplitN(waitForPendingQuestion(t, opened.ID()), "\x00", 2)[1],
 		"answer":    request,
 	}).mustSucceed(t)
-	waitForTurnEnd(t, opened, 10*time.Second)
 
-	// The result must be the same event type, keyed the same way, with the same
-	// text payload.
-	result := findEvent(t, opened, session.EventToolResult)
-	var wroteResult dshQuestionRecord
-	if err := json.Unmarshal([]byte(callRawJSON(t, opened, result)), &wroteResult); err != nil {
-		t.Fatalf("decode own result: %v", err)
+	// The reply must be the event DSH uses for a late answer, and its answers must
+	// carry the same keys as the batch DSH recorded.
+	reply := waitForQuestionReply(t, opened, 5*time.Second)
+	var wroteReply dshQuestionRecord
+	if err := json.Unmarshal([]byte(callRawJSON(t, opened, *reply)), &wroteReply); err != nil {
+		t.Fatalf("decode own reply: %v", err)
 	}
-	if wroteResult.Type != dshResult.Type {
-		t.Fatalf("result type = %q, want %q", wroteResult.Type, dshResult.Type)
+	if wroteReply.Type != session.EventUserMessage {
+		t.Fatalf("reply type = %q, want %q", wroteReply.Type, session.EventUserMessage)
 	}
-	if wroteResult.Data.Message.Source.Kind != dshResult.Data.Message.Source.Kind {
-		t.Fatalf("result source kind = %q, want %q",
-			wroteResult.Data.Message.Source.Kind, dshResult.Data.Message.Source.Kind)
+	if wroteReply.Data.Source.Kind != "user-question-reply" {
+		t.Fatalf("reply source kind = %q", wroteReply.Data.Source.Kind)
 	}
-	if len(wroteResult.Data.Message.Content) != 1 || wroteResult.Data.Message.Content[0].Type != "text" {
-		t.Fatalf("result content = %+v", wroteResult.Data.Message.Content)
-	}
-	// The batch must decode the same way on both sides: same keys, same shape.
 	var ownBatch, dshBatch map[string]any
-	if err := json.Unmarshal([]byte(wroteResult.Data.Message.Content[0].Text), &ownBatch); err != nil {
+	if err := json.Unmarshal([]byte(wroteReply.Data.Content[0].Text), &ownBatch); err != nil {
 		t.Fatalf("decode own batch: %v", err)
 	}
 	if err := json.Unmarshal([]byte(dshResult.Data.Message.Content[0].Text), &dshBatch); err != nil {
 		t.Fatalf("decode DSH batch: %v", err)
-	}
-	if got, want := sortedKeys(ownBatch), sortedKeys(dshBatch); got != want {
-		t.Fatalf("batch keys = %s, want %s", got, want)
 	}
 	ownAnswers := ownBatch["answers"].([]any)
 	if len(ownAnswers) != len(dshBatch["answers"].([]any)) {
 		t.Fatalf("answer count = %d, want %d", len(ownAnswers), len(dshBatch["answers"].([]any)))
 	}
 	for _, answer := range ownAnswers {
-		if got, want := sortedKeys(answer.(map[string]any)), sortedKeys(dshBatch["answers"].([]any)[0].(map[string]any)); got != want {
+		got := sortedKeys(answer.(map[string]any))
+		want := sortedKeys(dshBatch["answers"].([]any)[0].(map[string]any))
+		if got != want {
 			t.Fatalf("answer keys = %s, want %s", got, want)
 		}
 	}
@@ -252,44 +258,45 @@ func sortedKeys(value map[string]any) string {
 	return strings.Join(keys, ",")
 }
 
-// TestRequestHeaderToolSchemasMatchDSH keeps the logged schemas readable by DSH.
+// TestAskSchemaMatchesTheWebSnapshot is the strictest form of "same tool": the
+// whole schema object must equal the one the web preset hands the model.
 //
-// The session page decides which calls it can answer by looking for a `timeout`
-// parameter in the header's tool schemas. A schema whose fields serialize as
-// "Name"/"Parameters" is invisible to that lookup, so the question renders but can
-// never be submitted — which is exactly how a browser-only gap survives a
-// backend-only test. The comparison is against a real DSH schema list.
-func TestRequestHeaderToolSchemasMatchDSH(t *testing.T) {
+// Field-level checking is not enough here. The corrected contract is the absence of
+// a wait parameter as much as the presence of the question fields, and a schema
+// that quietly grows a `timeout` changes when the model thinks it will get an
+// answer.
+func TestAskSchemaMatchesTheWebSnapshot(t *testing.T) {
 	root := dshSnapshotRoot()
 	if root == "" {
 		t.Skip("no DeepSeek Harness checkout with tool schema snapshots; set DSH_GO_DSH_ROOT")
 	}
-	path := filepath.Join(root, "snapshots/web/creator-persona/tool-schemas.expected.json")
-	body, err := os.ReadFile(path)
+	body, err := os.ReadFile(filepath.Join(root, "snapshots/web/creator-persona/tool-schemas.expected.json"))
 	if err != nil {
 		t.Skipf("no tool schema fixture: %v", err)
 	}
 	var fixture struct {
-		Initial []map[string]any `json:"initial"`
+		Initial []json.RawMessage `json:"initial"`
 	}
 	if err := json.Unmarshal(body, &fixture); err != nil {
 		t.Fatalf("decode fixture: %v", err)
 	}
-	var dshAsk map[string]any
-	for _, schema := range fixture.Initial {
+	var want map[string]any
+	for _, raw := range fixture.Initial {
+		var schema map[string]any
+		if json.Unmarshal(raw, &schema) != nil {
+			continue
+		}
 		if schema["name"] == "ask_user_question" {
-			dshAsk = schema
+			want = schema
 			break
 		}
 	}
-	if dshAsk == nil {
+	if want == nil {
 		t.Skip("the fixture has no ask_user_question schema")
 	}
-	dshKeys := sortedKeys(dshAsk)
 
-	// This backend's own logged schema, encoded the way the session log encodes it.
 	executor := agent.NewToolExecutor(t.TempDir())
-	var own map[string]any
+	var got map[string]any
 	for _, def := range executor.Definitions() {
 		if def.Name != "ask_user_question" {
 			continue
@@ -298,28 +305,30 @@ func TestRequestHeaderToolSchemasMatchDSH(t *testing.T) {
 		if err != nil {
 			t.Fatalf("encode schema: %v", err)
 		}
-		if err := json.Unmarshal(encoded, &own); err != nil {
+		if err := json.Unmarshal(encoded, &got); err != nil {
 			t.Fatalf("decode schema: %v", err)
 		}
 	}
-	if own == nil {
-		t.Fatal("ask_user_question is not offered")
+	if got == nil {
+		t.Fatal("ask_user_question is not offered to the model")
 	}
-	if got := sortedKeys(own); got != dshKeys {
-		t.Fatalf("schema keys = %s, want %s", got, dshKeys)
+
+	// The wait parameter must not exist, in either shape.
+	if props, ok := got["parameters"].(map[string]any)["properties"].(map[string]any); ok {
+		if _, found := props["timeout"]; found {
+			t.Fatal("the schema declares a timeout; the web preset has none")
+		}
 	}
-	// The parameter names under `parameters.properties` must be DSH's too, and this
-	// backend's timed form must additionally declare the wait window.
-	ownProps := sortedKeys(own["parameters"].(map[string]any)["properties"].(map[string]any))
-	dshProps := sortedKeys(dshAsk["parameters"].(map[string]any)["properties"].(map[string]any))
-	if dshProps != "questions" {
-		t.Fatalf("the fixture's parameters changed: %s", dshProps)
+
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("encode own schema: %v", err)
 	}
-	if !strings.Contains(ownProps, "questions") {
-		t.Fatalf("parameters = %s, want questions among them", ownProps)
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("encode fixture schema: %v", err)
 	}
-	// The window is what lets a page answer the question at all.
-	if !strings.Contains(ownProps, "timeout") {
-		t.Fatalf("parameters = %s, want the wait window", ownProps)
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("schema differs from the web snapshot\n got: %s\nwant: %s", gotJSON, wantJSON)
 	}
 }

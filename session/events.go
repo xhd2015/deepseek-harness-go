@@ -3,23 +3,26 @@ package session
 // Durable event types this host writes. The vocabulary is a subset of the
 // Harness event list; the chat page and the SDK consumers need these.
 const (
-	EventPermissionPreset        = "permission/preset"
-	EventSandboxMode             = "sandbox/mode"
-	EventApprovalPolicy          = "approval/policy"
-	EventApprovalAsked           = "approval/asked"
-	EventApprovalDecided         = "approval/decided"
-	EventModelSelection          = "model/selection"
-	EventRequestHeader           = "request/header"
-	EventRequestContext          = "request/context"
-	EventTurnStart               = "turn/start"
-	EventTurnEnd                 = "turn/end"
-	EventStepStart               = "step/start"
-	EventStepEnd                 = "step/end"
-	EventUserMessage             = "user/message"
-	EventSystemMessage           = "system/message"
-	EventAssistantMessage        = "assistant/message"
-	EventAssistantAttempt        = "assistant/attempt"
-	EventToolCall                = "tool/call"
+	EventPermissionPreset = "permission/preset"
+	EventSandboxMode      = "sandbox/mode"
+	EventApprovalPolicy   = "approval/policy"
+	EventApprovalAsked    = "approval/asked"
+	EventApprovalDecided  = "approval/decided"
+	EventModelSelection   = "model/selection"
+	EventRequestHeader    = "request/header"
+	EventRequestContext   = "request/context"
+	EventTurnStart        = "turn/start"
+	EventTurnEnd          = "turn/end"
+	EventStepStart        = "step/start"
+	EventStepEnd          = "step/end"
+	EventUserMessage      = "user/message"
+	EventSystemMessage    = "system/message"
+	EventAssistantMessage = "assistant/message"
+	EventAssistantAttempt = "assistant/attempt"
+	EventToolCall         = "tool/call"
+	// EventWorkingDirectoryChange records a directory the model moved the session
+	// into. Later calls resolve relative paths against it.
+	EventWorkingDirectoryChange  = "working-directory/change"
 	EventToolResult              = "tool/result"
 	EventMessageEdit             = "message/edit"
 	EventSessionTitle            = "session/title"
@@ -42,23 +45,25 @@ const (
 // KnownEventTypes is the vocabulary this build interprets. A stored row this
 // build does not know is refused unless its writer marked it ignorable.
 var KnownEventTypes = map[string]bool{
-	EventPermissionPreset:        true,
-	EventSandboxMode:             true,
-	EventApprovalPolicy:          true,
-	EventApprovalAsked:           true,
-	EventApprovalDecided:         true,
-	EventModelSelection:          true,
-	EventRequestHeader:           true,
-	EventRequestContext:          true,
-	EventTurnStart:               true,
-	EventTurnEnd:                 true,
-	EventStepStart:               true,
-	EventStepEnd:                 true,
-	EventUserMessage:             true,
-	EventSystemMessage:           true,
-	EventAssistantMessage:        true,
-	EventAssistantAttempt:        true,
-	EventToolCall:                true,
+	EventPermissionPreset: true,
+	EventSandboxMode:      true,
+
+	EventApprovalPolicy:   true,
+	EventApprovalAsked:    true,
+	EventApprovalDecided:  true,
+	EventModelSelection:   true,
+	EventRequestHeader:    true,
+	EventRequestContext:   true,
+	EventTurnStart:        true,
+	EventTurnEnd:          true,
+	EventStepStart:        true,
+	EventStepEnd:          true,
+	EventUserMessage:      true,
+	EventSystemMessage:    true,
+	EventAssistantMessage: true,
+	EventAssistantAttempt: true,
+	EventToolCall:         true,
+
 	EventToolResult:              true,
 	EventMessageEdit:             true,
 	EventSessionTitle:            true,

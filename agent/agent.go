@@ -117,6 +117,10 @@ type Runner struct {
 	onStatus       func(sessionID string, running bool)
 	pendingNotices map[string][]string
 	waking         map[string]bool
+	// pendingFollowup marks a session whose next turn is already committed to the
+	// log. The follow-up must start only after the current turn has fully unwound,
+	// because Start refuses a session that is still running.
+	pendingFollowup map[string]bool
 }
 
 // New builds a runner.
@@ -178,13 +182,14 @@ func New(cfg Config) *Runner {
 		}
 	}
 	return &Runner{
-		cfg:            cfg,
-		catalog:        catalog,
-		clients:        clients,
-		tools:          tools,
-		cancels:        map[string]context.CancelFunc{},
-		pendingNotices: map[string][]string{},
-		waking:         map[string]bool{},
+		cfg:             cfg,
+		catalog:         catalog,
+		clients:         clients,
+		tools:           tools,
+		cancels:         map[string]context.CancelFunc{},
+		pendingNotices:  map[string][]string{},
+		pendingFollowup: map[string]bool{},
+		waking:          map[string]bool{},
 	}
 }
 
@@ -491,6 +496,27 @@ func (r *Runner) wakeIdle(sess *session.Session) {
 	r.mu.Unlock()
 
 	go func() {
+		// A committed follow-up runs before any notice: the person's conversation
+		// should not be interrupted by a job report that arrived a moment earlier.
+		if r.takeFollowup(id) {
+			if !r.Start(context.Background(), PromptRequest{
+				Session:      sess,
+				Content:      []ContentPart{{Type: "text", Text: session.ThinkingCapAutoContinueText}},
+				Source:       map[string]any{"kind": "thinking-cap-auto-continue"},
+				Continuation: true,
+			}) {
+				// Lost the race to another turn; the log still holds the message,
+				// so the next prompt reads it as history rather than as a new turn.
+				r.mu.Lock()
+				delete(r.waking, id)
+				r.mu.Unlock()
+				return
+			}
+			r.mu.Lock()
+			delete(r.waking, id)
+			r.mu.Unlock()
+			return
+		}
 		notices := r.takeNotices(id)
 		r.mu.Lock()
 		delete(r.waking, id)
@@ -611,4 +637,22 @@ func (r *Runner) logf(format string, args ...any) {
 	if r.cfg.Logf != nil {
 		r.cfg.Logf(format, args...)
 	}
+}
+
+// queueFollowup marks one session whose next turn is already in the log.
+func (r *Runner) queueFollowup(sessionID string) {
+	r.mu.Lock()
+	r.pendingFollowup[sessionID] = true
+	r.mu.Unlock()
+}
+
+// takeFollowup consumes and reports the pending follow-up flag.
+func (r *Runner) takeFollowup(sessionID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.pendingFollowup[sessionID] {
+		return false
+	}
+	delete(r.pendingFollowup, sessionID)
+	return true
 }

@@ -117,6 +117,9 @@ type Request struct {
 	ReasoningEffort string
 	MaxTokens       int
 	Temperature     *float64
+	// SessionID lets a proxy bill and route per conversation. It is attribution,
+	// not state: a provider that ignores it still answers correctly.
+	SessionID string
 }
 
 // Usage is token accounting for one completion.

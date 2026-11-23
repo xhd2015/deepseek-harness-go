@@ -251,11 +251,13 @@ func (s *Service) actOnHistory(opened *session.Session, requestID string) bool {
 func (s *Service) injectEvents(opened *session.Session, messages []injectMessage) ([]session.Event, error) {
 	turn := nextTurn(opened.Events())
 	var events []session.Event
-	// A tool result cites a call by its batch position or by a committed call
-	// seq; both resolve to the call id the log stores.
+	// A tool result cites its call by seq. DSH numbers the batch entries from the
+	// current head, so a call inside this batch is addressed by the seq it is about
+	// to receive — `head + index` — and a call from an earlier turn by its
+	// committed seq. Both spellings must resolve, because agent-pro sends either.
 	batchCalls := map[int64]string{}
 	batchCallSeqs := map[int64]int64{}
-	nextSeq := opened.LastSeq() + 1
+	head := opened.LastSeq() + 1
 	knownCalls := existingCallIDs(opened.Events())
 	for index, message := range messages {
 		switch message.Kind {
@@ -299,8 +301,11 @@ func (s *Service) injectEvents(opened *session.Session, messages []injectMessage
 			if strings.TrimSpace(message.Tool) == "" || strings.TrimSpace(message.Arguments) == "" {
 				return nil, fail(CodeBadRequest, "injected tool-call needs a tool name and arguments")
 			}
+			// A call is addressed by the seq it will occupy, so a result later in this
+			// same batch can name it before it exists.
 			callID := session.NewID()
-			batchCalls[int64(index)] = callID
+			callSeq := head + int64(len(events))
+			batchCalls[callSeq] = callID
 			events = append(events, session.Event{
 				Type: session.EventToolCall,
 				Data: mustRaw(map[string]any{
@@ -312,13 +317,21 @@ func (s *Service) injectEvents(opened *session.Session, messages []injectMessage
 				}),
 				Ignorable: true,
 			})
-			batchCallSeqs[int64(index)] = nextSeq + int64(len(events)-1)
+			batchCallSeqs[callSeq] = callSeq
 		case "tool-result":
 			if strings.TrimSpace(message.Text) == "" {
 				return nil, fail(CodeBadRequest, "injected tool-result has no text")
 			}
 			callID := batchCalls[message.Call]
 			sourceSeq := batchCallSeqs[message.Call]
+			if callID == "" {
+				// A bare position inside the batch is a convenience spelling; accept it
+				// only when it cannot be confused with a committed seq.
+				if candidate, ok := batchCalls[head+message.Call]; ok && message.Call < int64(len(messages)) {
+					callID = candidate
+					sourceSeq = head + message.Call
+				}
+			}
 			if callID == "" {
 				callID = knownCalls[message.Call]
 				sourceSeq = message.Call

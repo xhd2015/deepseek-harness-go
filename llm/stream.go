@@ -58,7 +58,7 @@ func (c *Client) Stream(ctx context.Context, req Request, emit func(Chunk) error
 			}
 		}
 		before := emitted
-		retry, err := c.streamOnce(ctx, encoded, deliver)
+		retry, err := c.streamOnce(ctx, encoded, req.SessionID, deliver)
 		if err == nil {
 			completion := acc.completion()
 			if !hasVisibleContent(completion) {
@@ -77,7 +77,7 @@ func (c *Client) Stream(ctx context.Context, req Request, emit func(Chunk) error
 	return acc.completion(), last
 }
 
-func (c *Client) streamOnce(ctx context.Context, encoded []byte, emit func(Chunk) error) (bool, error) {
+func (c *Client) streamOnce(ctx context.Context, encoded []byte, sessionID string, emit func(Chunk) error) (bool, error) {
 	path := "/chat/completions"
 	switch c.cfg.Protocol {
 	case ProtocolAnthropicMessages:
@@ -101,6 +101,13 @@ func (c *Client) streamOnce(ctx context.Context, encoded []byte, emit func(Chunk
 	}
 	for key, value := range c.cfg.Headers {
 		request.Header.Set(key, value)
+	}
+	// Attribution headers, so an upstream proxy can attribute a request to a
+	// conversation without parsing the body. Configured headers win: a deployment
+	// that sets its own value has a reason to.
+	setIfAbsent(request.Header, agentRunnerHeader, agentRunnerValue)
+	if sessionID != "" {
+		setIfAbsent(request.Header, dshSessionHeader, sessionID)
 	}
 	response, err := c.cfg.HTTPClient.Do(request)
 	if err != nil {
@@ -1981,3 +1988,21 @@ func encodeResponsesRequest(req Request) []byte {
 
 // keep strconv imported for compatibility with older helpers
 var _ = strconv.Itoa
+
+// Attribution headers DSH sends on inference requests.
+const (
+	// agentRunnerHeader identifies this harness to a proxy that routes by client.
+	agentRunnerHeader = "x-agent-runner"
+	// agentRunnerValue is the name DSH reports itself as.
+	agentRunnerValue = "dsh"
+	// dshSessionHeader carries the durable session id for per-conversation
+	// billing and routing.
+	dshSessionHeader = "x-dsh-session-id"
+)
+
+// setIfAbsent sets a header unless the deployment already configured one.
+func setIfAbsent(headers http.Header, name, value string) {
+	if headers.Get(name) == "" {
+		headers.Set(name, value)
+	}
+}

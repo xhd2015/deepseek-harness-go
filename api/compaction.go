@@ -140,36 +140,54 @@ func (s *Service) compactIntoNew(args json.RawMessage) (any, error) {
 	if strings.TrimSpace(request.SessionID) == "" {
 		return nil, fail(CodeBadRequest, "sessionId is required")
 	}
-	if s.cfg.Runner == nil {
-		return nil, fail(CodeUnimplemented, "compaction is not configured")
+	if s.cfg.Runner == nil || s.cfg.Store == nil {
+		return nil, fail(CodeUnimplemented, "a compacted reset needs a session store")
+	}
+	if s.cfg.Runner.Busy(request.SessionID) {
+		// The surface must not move while it is being read into a request.
+		return nil, fail(CodeBusy, "session is running; wait for the current turn before resetting")
 	}
 	source, err := s.openSession(request.SessionID)
 	if err != nil {
 		return nil, err
 	}
-	compacted, err := s.cfg.Runner.CompactNow(request.SessionID)
-	if err != nil {
-		return nil, fail(CodeBusy, err.Error())
-	}
-	// The child is the source's surface, which the compaction just rewrote — the
-	// same seed builder the ordinary fork uses, so an open turn is closed the same
-	// way and a reader cannot tell the two apart.
+	// A reset does not compact first: the surface already carries whatever
+	// compaction produced, and with no context pressure a fresh /compact retains
+	// nothing and would swallow the turns this seed exists to keep.
 	events := source.Events()
-	boundary := int64(-1)
-	if len(events) > 0 {
-		boundary = events[len(events)-1].Seq
+	surface := source.Surface()
+	tokensBefore := compactedSeedTokens(surface)
+	hadCheckpoint := false
+	for _, event := range surface {
+		if event.Type == session.EventUserMessage && sourceKindOf(event) == "compact-checkpoint" {
+			hadCheckpoint = true
+			break
+		}
+	}
+	seed := buildCompactedSeed(events, surface)
+	if len(seed) == 0 {
+		return nil, fail(CodeForkUnavailable, "this session has no history to seed from")
 	}
 	cwd := strings.TrimSpace(request.Cwd)
 	if cwd == "" {
 		cwd = source.Cwd()
 	}
-	seed := forkedPrefix(events, boundary)
 	child, err := s.cfg.Store.CreateSeeded(cwd, source.Header(), seed)
 	if err != nil {
-		return nil, fail(CodeInternal, "fork child: "+err.Error())
+		return nil, fail(CodeInternal, "compacted session: "+err.Error())
 	}
 	s.Workspaces.Add(cwd)
-	return map[string]any{"sessionId": child.ID(), "compacted": compacted}, nil
+	value := map[string]any{
+		"sessionId": child.ID(),
+		// `compacted` reports whether the source carried a compaction checkpoint,
+		// which is what DSH returns: the reset always runs, the flag says whether
+		// a summary was part of what it kept.
+		"compacted": hadCheckpoint,
+	}
+	if removed := tokensBefore - compactedSeedTokens(child.Events()); removed > 0 {
+		value["compactedTokens"] = removed
+	}
+	return value, nil
 }
 
 // sortInt64 orders a seq list ascending without importing a generic sort.

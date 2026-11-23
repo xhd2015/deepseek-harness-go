@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,9 +24,23 @@ import (
 
 type fakeModel struct {
 	answer string
+
+	mu       sync.Mutex
+	requests []string
+}
+
+// fakeRequests returns the bodies the model was sent, in order.
+func (f *fixture) fakeRequests() []string {
+	f.model.mu.Lock()
+	defer f.model.mu.Unlock()
+	return append([]string(nil), f.model.requests...)
 }
 
 func (f *fakeModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	f.mu.Lock()
+	f.requests = append(f.requests, string(body))
+	f.mu.Unlock()
 	w.Header().Set("Content-Type", "text/event-stream")
 	answer, _ := json.Marshal(f.answer)
 	_, _ = w.Write([]byte(`data: {"model":"fake-model","choices":[{"delta":{"content":` + string(answer) + `}}]}` + "\n\n"))
@@ -36,12 +51,14 @@ type fixture struct {
 	service *Service
 	store   *session.Store
 	runner  *agent.Runner
+	model   *fakeModel
 	root    string
 }
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	model := httptest.NewServer(&fakeModel{answer: "hello from the fake model"})
+	fake := &fakeModel{answer: "hello from the fake model"}
+	model := httptest.NewServer(fake)
 	t.Cleanup(model.Close)
 	root := t.TempDir()
 	store, err := session.NewStore(filepath.Join(root, "sessions"))
@@ -64,7 +81,7 @@ func newFixture(t *testing.T) *fixture {
 		AgentPreset: "std-no-subagent",
 		HomeDir:     root,
 	})
-	return &fixture{service: service, store: store, runner: runner, root: root}
+	return &fixture{service: service, store: store, runner: runner, model: fake, root: root}
 }
 
 func (f *fixture) createSession(t *testing.T) *session.Session {
@@ -678,14 +695,21 @@ func TestModelCatalogAndSelection(t *testing.T) {
 	projections := f.invoke(t, "session/projections", map[string]any{
 		"request": map[string]any{"sessionId": opened.ID()},
 	}).mustSucceed(t)
+	// Read one projection at a time: `values` mixes shapes by design (the model
+	// selection is an object, the thinking-cap policy is a boolean), so a single
+	// struct type for every key cannot decode it.
 	var baseline struct {
-		Values map[string]struct {
-			Next map[string]any `json:"next"`
-		} `json:"values"`
+		Values map[string]json.RawMessage `json:"values"`
 	}
 	decode(t, projections, &baseline)
-	if baseline.Values["modelSelection"].Next["reasoningEffort"] != "high" {
-		t.Fatalf("modelSelection = %+v", baseline.Values["modelSelection"])
+	var selectionProjection struct {
+		Next map[string]any `json:"next"`
+	}
+	if err := json.Unmarshal(baseline.Values["modelSelection"], &selectionProjection); err != nil {
+		t.Fatalf("decode modelSelection: %v", err)
+	}
+	if selectionProjection.Next["reasoningEffort"] != "high" {
+		t.Fatalf("modelSelection = %+v", selectionProjection)
 	}
 }
 

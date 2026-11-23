@@ -48,6 +48,9 @@ func Baseline(header Header, events []Event) ProjectionBaseline {
 	// The question card is rendered from this face, so a backend that records an
 	// ask without folding it leaves the user with a question they cannot answer.
 	values[QuestionProjectionKey] = userQuestionsProjection(events)
+	// The policy reaches the client as one boolean: the streak is host-only state,
+	// and a client that saw it would start reasoning about a limit it cannot act on.
+	values[ThinkingCapProjectionKey] = FoldThinkingCapAutoContinue(events).Enabled
 	return ProjectionBaseline{AsOfSeq: asOfSeq, Values: values}
 }
 

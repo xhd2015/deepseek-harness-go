@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"runtime/debug"
 	"strings"
@@ -109,6 +110,12 @@ func (r *Runner) drive(ctx context.Context, sess *session.Session, turn int, rou
 			return
 		}
 		if step > 1 {
+			// A model selected mid-turn takes effect here, at the boundary: swapping
+			// inside a request would cut the reasoning and tool-call semantics the
+			// step already committed to.
+			if next, nextClient, err := r.resolve(r.currentSelection(sess)); err == nil {
+				route, client = next, nextClient
+			}
 			r.appendPendingNotices(sess)
 			if _, err := sess.Append(session.EventStepStart, map[string]any{"turn": turn, "step": step}); err != nil {
 				r.finishStepError(sess, turn, step, err)
@@ -117,17 +124,7 @@ func (r *Runner) drive(ctx context.Context, sess *session.Session, turn int, rou
 		}
 		// The request header records the route and the assembled tool schemas a
 		// committed request actually used; consumers fold it into lastUsed.
-		if _, err := sess.Append(session.EventRequestHeader, map[string]any{
-			"header": map[string]any{
-				"config": map[string]any{
-					"provider":        route.Provider,
-					"model":           route.Model,
-					"reasoningEffort": route.ReasoningEffort,
-				},
-				"tools": r.tools.Definitions(),
-			},
-			"reason": "change",
-		}); err != nil {
+		if err := r.logRequestHeader(sess, route); err != nil {
 			r.finishStepError(sess, turn, step, err)
 			return
 		}
@@ -137,6 +134,7 @@ func (r *Runner) drive(ctx context.Context, sess *session.Session, turn int, rou
 			ReasoningEffort: route.ReasoningEffort,
 			Messages:        r.history(sess),
 			Tools:           r.tools.Definitions(),
+			SessionID:       sess.ID(),
 		}, func(chunk llm.Chunk) error {
 			return attempt.Push(chunk)
 		})
@@ -156,6 +154,11 @@ func (r *Runner) drive(ctx context.Context, sess *session.Session, turn int, rou
 		if completion.FinishReason == "max-tokens" {
 			r.endStep(sess, turn, step)
 			r.endTurn(sess, turn, map[string]any{"kind": "max-tokens"})
+			// A reasoning-only stop spent the whole budget thinking and said nothing.
+			// With the per-session policy on, follow it up instead of leaving the
+			// person to type "keep going" — bounded, so a model stuck at the cap
+			// returns control rather than looping on the user's budget.
+			r.followupThinkingCap(ctx, sess)
 			return
 		}
 
@@ -449,4 +452,122 @@ func abortedReason() map[string]any {
 func emptyUsage(usage llm.Usage) bool {
 	return usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.CacheReadTokens == 0 &&
 		usage.CacheWriteTokens == 0 && usage.TotalTokens == 0 && usage.ReasoningTokens == 0
+}
+
+// followupThinkingCap queues `continue(auto)` after a reasoning-only output-cap stop.
+//
+// The decision is read from the log, not from a live counter: a resumed session
+// must not start its streak over, and the log is the only thing that survives a
+// restart.
+func (r *Runner) followupThinkingCap(ctx context.Context, sess *session.Session) {
+	state := session.FoldThinkingCapAutoContinue(sess.Events())
+	if !session.ShouldFollowupThinkingCap(state) {
+		return
+	}
+	// Only when nothing else is waiting: a queued prompt is the person's own next
+	// turn, and interleaving an automatic one would reorder their conversation.
+	if _, err := sess.AppendSurface(session.EventUserMessage, map[string]any{
+		"role": "user",
+		"id":   session.NewID(),
+		"content": []any{map[string]any{
+			"type": "text",
+			"text": session.ThinkingCapAutoContinueText,
+		}},
+		"source": map[string]any{"kind": "thinking-cap-auto-continue"},
+	}); err != nil {
+		r.logf("session %s: append auto-continue: %v", sess.ID(), err)
+		return
+	}
+	// The current turn is still unwinding here, so the follow-up is queued rather
+	// than started: Start refuses a session that is already running, by design.
+	r.queueFollowup(sess.ID())
+}
+
+// logRequestHeader records the request envelope when it differs from the last one.
+//
+// Writing it every step would grow the log with records that say the same thing,
+// and a reader folding `request/header` would see a change on every step. The
+// first write of a session is `initial`; a session that already carries one and
+// then changes route or tools gets `change`.
+func (r *Runner) logRequestHeader(sess *session.Session, route modelconfig.Route) error {
+	header := map[string]any{
+		"config": map[string]any{
+			"provider":        route.Provider,
+			"model":           route.Model,
+			"reasoningEffort": route.ReasoningEffort,
+		},
+		"tools": r.tools.Definitions(),
+	}
+	previous, hasPrevious := lastRequestHeader(sess.Events())
+	if hasPrevious && sameRequestHeader(previous, header) {
+		return nil
+	}
+	reason := "change"
+	if !hasPrevious {
+		reason = "initial"
+	}
+	_, err := sess.Append(session.EventRequestHeader, map[string]any{"header": header, "reason": reason})
+	return err
+}
+
+// lastRequestHeader reads the most recent recorded envelope.
+func lastRequestHeader(events []session.Event) (map[string]any, bool) {
+	for index := len(events) - 1; index >= 0; index-- {
+		if events[index].Type != session.EventRequestHeader {
+			continue
+		}
+		var payload struct {
+			Header map[string]any `json:"header"`
+		}
+		if json.Unmarshal(events[index].Data, &payload) != nil || payload.Header == nil {
+			return nil, false
+		}
+		return payload.Header, true
+	}
+	return nil, false
+}
+
+// sameRequestHeader reports whether two envelopes would send the same request.
+//
+// Only the parts a provider can see are compared: the route and the tool names.
+// Comparing the whole document would report a change whenever a schema's prose was
+// rewritten, which is not something the model's request depends on.
+func sameRequestHeader(left, right map[string]any) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	leftConfig, _ := left["config"].(map[string]any)
+	rightConfig, _ := right["config"].(map[string]any)
+	for _, key := range []string{"provider", "model", "reasoningEffort"} {
+		if stringField(leftConfig, key) != stringField(rightConfig, key) {
+			return false
+		}
+	}
+	return strings.Join(toolNamesOf(left["tools"]), ",") == strings.Join(toolNamesOf(right["tools"]), ",")
+}
+
+// stringField reads one string out of a loose map.
+func stringField(source map[string]any, key string) string {
+	if source == nil {
+		return ""
+	}
+	value, _ := source[key].(string)
+	return value
+}
+
+// toolNamesOf lists the tool names in a recorded schema list.
+func toolNamesOf(tools any) []string {
+	list, ok := tools.([]any)
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(list))
+	for _, entry := range list {
+		if record, ok := entry.(map[string]any); ok {
+			if name, ok := record["name"].(string); ok {
+				names = append(names, name)
+			}
+		}
+	}
+	return names
 }

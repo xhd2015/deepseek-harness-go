@@ -115,9 +115,12 @@ func (s *Session) Compact(input CompactionInput) error {
 	// rebuilds the conversation from the summary instead of from the originals.
 	replacement := map[string]any{
 		"content": []any{map[string]any{"type": "text", "text": input.Summary}},
-		"source":  map[string]any{"kind": "compaction", "compactionId": input.CompactionID},
-		"role":    "user",
-		"id":      NewID(),
+		// The kind is the marker a compacted reset looks for: it distinguishes the
+		// summary that replaced old history from a question the person asked. A
+		// reader that guessed from the text instead would keep summarizing summaries.
+		"source": map[string]any{"kind": "compact-checkpoint", "compactionId": input.CompactionID},
+		"role":   "user",
+		"id":     NewID(),
 	}
 	raw, err := EncodeData(replacement)
 	if err != nil {

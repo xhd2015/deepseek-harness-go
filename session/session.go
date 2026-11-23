@@ -615,3 +615,16 @@ func (s *Session) AppendReplacing(typ string, data []byte, span SeqRange) (Event
 		SurfaceOp: &SurfaceOp{Replace: true, StartSeq: span.Start, EndSeq: span.End},
 	})
 }
+
+// AppendIgnorable records one event a compatible reader may skip.
+//
+// This is how a preference is stored: a session written by a build that predates
+// the preference must still open, so the record says of itself that ignoring it is
+// allowed.
+func (s *Session) AppendIgnorable(typ string, data any) (Event, error) {
+	raw, err := EncodeData(data)
+	if err != nil {
+		return Event{}, err
+	}
+	return s.append(Event{Type: typ, Data: raw, Ignorable: true})
+}

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xhd2015/deepseek-harness-go/session"
 )
@@ -619,4 +620,129 @@ func TestStatusOmitsUnknownIDs(t *testing.T) {
 			t.Fatalf("all-ids answer invented %q", id)
 		}
 	}
+}
+
+// TestInjectPairingUsesAbsoluteSeqs is the agent-pro shape: a result names the seq
+// its call is about to occupy, which it cannot know from the reply yet.
+func TestInjectPairingUsesAbsoluteSeqs(t *testing.T) {
+	f := newFixture(t)
+	opened := f.createSession(t)
+	// One committed event, so the batch does not start at zero: a backend that
+	// treated the call as a bare position would still pass on an empty session.
+	if _, err := opened.AppendSurface(session.EventUserMessage, map[string]any{
+		"role": "user", "id": session.NewID(),
+		"content": []any{map[string]any{"type": "text", "text": "earlier"}},
+		"source":  map[string]any{"kind": "user"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	head := opened.LastSeq() + 1
+
+	var receipt struct {
+		Seqs       []int64 `json:"seqs"`
+		CallSeqs   []int64 `json:"callSeqs"`
+		ResultSeqs []int64 `json:"resultSeqs"`
+	}
+	decode(t, f.invoke(t, "session/inject", map[string]any{"request": map[string]any{
+		"requestId": "inject-abs",
+		"sessionId": opened.ID(),
+		"messages": []map[string]any{
+			{"kind": "tool-call", "tool": "bash", "arguments": `{"command":"true"}`},
+			{"kind": "tool-result", "call": head, "text": "ok"},
+		},
+	}}).mustSucceed(t), &receipt)
+
+	if len(receipt.CallSeqs) != 1 || receipt.CallSeqs[0] != head {
+		t.Fatalf("callSeqs = %v, want the call at seq %d", receipt.CallSeqs, head)
+	}
+	if len(receipt.ResultSeqs) != 1 || receipt.ResultSeqs[0] != head+1 {
+		t.Fatalf("resultSeqs = %v, want the result at seq %d", receipt.ResultSeqs, head+1)
+	}
+	// And the pair actually answers each other in the log.
+	var callID string
+	for _, event := range opened.Events() {
+		if event.Type != session.EventToolCall {
+			continue
+		}
+		var data struct {
+			CallID string `json:"callId"`
+		}
+		_ = json.Unmarshal(event.Data, &data)
+		callID = data.CallID
+	}
+	if callID == "" {
+		t.Fatal("no call was written")
+	}
+	for _, event := range opened.Events() {
+		if event.Type != session.EventToolResult {
+			continue
+		}
+		var data struct {
+			Message struct {
+				ToolCallID string `json:"toolCallId"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal(event.Data, &data); err != nil || data.Message.ToolCallID != callID {
+			t.Fatalf("result does not answer call %q: %+v", callID, data)
+		}
+	}
+}
+
+// TestEditRewritesWhatTheModelSees is the user-visible promise: an edited message
+// is what the next request carries, not just a new record in the log.
+func TestEditRewritesWhatTheModelSees(t *testing.T) {
+	f := newFixture(t)
+	opened := f.createSession(t)
+	f.invoke(t, "session/prompt", map[string]any{
+		"request": map[string]any{
+			"sessionId": opened.ID(),
+			"content":   []map[string]any{{"type": "text", "text": "original question"}},
+		},
+	}).mustSucceed(t)
+	waitForTurnEnds(t, opened, 1, 10*1000*1000*1000)
+
+	// Edit the user message the model will see again.
+	var target int64 = -1
+	for _, event := range opened.Events() {
+		if event.Type != session.EventUserMessage {
+			continue
+		}
+		if strings.Contains(string(event.Data), "original question") {
+			target = event.Seq
+		}
+	}
+	if target < 0 {
+		t.Fatal("no user message to edit")
+	}
+	before := len(f.fakeRequests())
+	var receipt struct {
+		Seq     int64 `json:"seq"`
+		Started bool  `json:"started"`
+	}
+	decode(t, f.invoke(t, "session/edit", map[string]any{"request": map[string]any{
+		"requestId": "edit-1",
+		"sessionId": opened.ID(),
+		"edits":     []map[string]any{{"seq": target, "text": "corrected question"}},
+	}}).mustSucceed(t), &receipt)
+	if receipt.Seq == 0 {
+		t.Fatal("the edit record has no seq")
+	}
+
+	// The next request carries the new text and not the old one.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		requests := f.fakeRequests()
+		if len(requests) > before {
+			last := requests[len(requests)-1]
+			if !strings.Contains(last, "corrected question") {
+				t.Fatalf("the edited text is not in the next request: %s", last)
+			}
+			if strings.Contains(last, "original question") {
+				t.Fatalf("the old text is still sent: %s", last)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the agent never made a follow-up request")
 }

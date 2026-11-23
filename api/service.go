@@ -218,6 +218,8 @@ func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 		return s.compaction(args)
 	case "session/compactIntoNew":
 		return s.compactIntoNew(args)
+	case "session/setThinkingCapAutoContinue":
+		return s.setThinkingCapAutoContinue(args)
 	case "commands/list":
 		return s.commandsList(args)
 	case "commands/execute":

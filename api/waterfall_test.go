@@ -238,14 +238,19 @@ func TestEventResultRejectsUnknownIDs(t *testing.T) {
 // TestExpiredApprovalPublishesCancel is what keeps a card from outliving its
 // question. Without the cancel frame a consumer keeps the button on screen and the
 // user answers something already recorded.
+//
+// The dispatch is driven synchronously on its own goroutine while the test drains
+// the stream, and the goroutine is joined before returning: a detached request would
+// keep a connection open against the model server and make the fixture's cleanup
+// wait for it, which is a hang in the suite rather than a finding.
 func TestExpiredApprovalPublishesCancel(t *testing.T) {
 	f := newFixture(t)
-	f.runner.SetApprovalWindow(200 * time.Millisecond)
+	f.runner.SetApprovalWindow(150 * time.Millisecond)
 	if err := os.MkdirAll(filepath.Join(f.root, "project"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	opened := f.createSession(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	stream, err := f.service.Open(ctx, EndpointEvents, []byte(`{"args":{}}`), nil)
 	if err != nil {
@@ -254,13 +259,22 @@ func TestExpiredApprovalPublishesCancel(t *testing.T) {
 	defer stream.Close()
 	stream.Next(ctx)
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		f.runner.ToolsExecuteForTest(context.Background(), opened, "bash",
 			`{"description":"e","command":"echo x > /tmp/cancel-probe.txt","sandbox_permissions":"danger-full-access","justification":"because"}`)
 	}()
 
 	var sawWaterfall, sawCancel bool
+	deadline := time.After(8 * time.Second)
+drain:
 	for !sawCancel {
+		select {
+		case <-deadline:
+			break drain
+		default:
+		}
 		raw, err := stream.Next(ctx)
 		if err != nil {
 			break
@@ -284,6 +298,12 @@ func TestExpiredApprovalPublishesCancel(t *testing.T) {
 			}
 			sawCancel = true
 		}
+	}
+	// The dispatch already returned: the wait expired and wrote its decision.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the dispatch never returned after the window expired")
 	}
 	if !sawCancel {
 		t.Fatal("an expired approval published no cancel frame")

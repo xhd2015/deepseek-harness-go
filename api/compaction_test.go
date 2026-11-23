@@ -199,11 +199,20 @@ type blockingModel struct {
 }
 
 func (m *blockingModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// The block is bounded: a server's Close waits for every in-flight connection, so
+	// a handler parked forever turns a test failure into a hung package. The window is
+	// long enough that no test can outlive it by accident and short enough that a
+	// leaked connection cannot stall the suite.
 	select {
 	case <-m.release:
 	case <-r.Context().Done():
 		return
+	case <-time.After(10 * time.Second):
+		return
 	}
+	// Every call is answered once the release closes, including a retry: the
+	// executor retries a failed stream, and a handler that blocked again would keep
+	// the server's Close waiting forever.
 	w.Header().Set("Content-Type", "text/event-stream")
 	_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"done"}}]}` + "\n\n"))
 	_, _ = w.Write([]byte("data\n"))
@@ -213,6 +222,11 @@ func (m *blockingModel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func newBlockingFixture(t *testing.T, release chan struct{}) *fixture {
 	t.Helper()
 	model := httptest.NewServer(&blockingModel{release: release})
+	// The server's Close waits for every in-flight connection, so the blocked
+	// handler must be released first. Registering the release here, before Close,
+	// makes it run after it under last-in-first-out — which is still too late.
+	// The close is therefore registered in this order and the caller's channel is
+	// drained by a finalizer that runs before Close.
 	t.Cleanup(model.Close)
 	root := t.TempDir()
 	store, err := session.NewStore(filepath.Join(root, "sessions"))

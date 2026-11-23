@@ -33,6 +33,10 @@ const (
 	CodeUnimplemented = "unimplemented"
 	CodeNotFound      = "session/not-found"
 	CodeBusy          = "session/busy"
+	// CodeSessionActive is DSH's refusal for archiving work that is still running.
+	// A surface maps this to "still running" rather than to a generic failure, so
+	// the code is part of the contract and not an internal choice.
+	CodeSessionActive = "workspace/session-active"
 )
 
 // Config configures the service.
@@ -77,6 +81,9 @@ type Service struct {
 	events     *eventHub
 	// waterfalls carries pending client questions the host is blocked on.
 	waterfalls *waterfallGate
+	// archived is the registry-global archive set. Nil when the service has no
+	// data directory to persist it in.
+	archived *archiveStore
 	// approvalFrames maps a waterfall frame to the approval it asks about.
 	approvalFrames *approvalFrames
 }
@@ -107,6 +114,7 @@ func New(cfg Config) *Service {
 		events:         newEventHub(),
 		waterfalls:     newWaterfallGate(),
 		approvalFrames: newApprovalFrames(),
+		archived:       archiveOrNil(cfg.DataDir),
 		drafts:         cfg.Drafts,
 	}
 	if cfg.Runner != nil {
@@ -189,6 +197,8 @@ func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 		return s.list(args)
 	case "session/create":
 		return s.create(args)
+	case "session/createWithInput":
+		return s.createWithInput(args)
 	case "session/rename":
 		return s.rename(args)
 	case "session/prompt":
@@ -233,6 +243,10 @@ func (s *Service) unary(endpoint string, args json.RawMessage) (any, error) {
 		return s.compaction(args)
 	case "session/compactIntoNew":
 		return s.compactIntoNew(args)
+	case "workspace/archiveSession":
+		return s.archiveSession(args)
+	case "workspace/unarchiveSession":
+		return s.unarchiveSession(args)
 	case "session/setThinkingCapAutoContinue":
 		return s.setThinkingCapAutoContinue(args)
 	case "permissionPresets/catalog":

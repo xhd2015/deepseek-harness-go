@@ -130,7 +130,10 @@ func (r *Runner) askApproval(sess *session.Session, toolName, callID, reason str
 		"callId":   callID,
 		"reason":   reason,
 	}); err != nil {
-		// Without the question the pair cannot be honest; fail closed.
+		// Without the question the pair cannot be honest; fail closed. The failure
+		// is logged because the alternative is a silent `unavailable` that looks
+		// identical to "nobody was listening" from the outside.
+		r.logf("session %s: cannot record approval/asked: %v", sess.ID(), err)
 		return ApprovalUnavailable
 	}
 	answer := r.approvals.ask(ApprovalRequest{
@@ -147,6 +150,9 @@ func (r *Runner) askApproval(sess *session.Session, toolName, callID, reason str
 		// request fails closed immediately instead of waiting out a window that has
 		// no one on the other end.
 		if r.notifyApproval == nil {
+			// No page hook: this deployment cannot ask. Logged so the difference
+			// between "not wired" and "asked but unanswered" is visible.
+			r.logf("session %s: approval %s has no notifier installed", sess.ID(), id)
 			outcome = ApprovalUnavailable
 		} else {
 			// The notifier must only DELIVER the question. Running the wait inside it

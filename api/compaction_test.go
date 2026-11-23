@@ -236,3 +236,106 @@ func newBlockingFixture(t *testing.T, release chan struct{}) *fixture {
 	})
 	return &fixture{service: service, store: store, runner: runner, root: root}
 }
+
+// TestPruneReachesTheDisk proves the prune survives a process boundary: a second
+// store over the same root, which can only read what was written, sees it. The
+// log is compressed, so reading the file bytes would prove nothing.
+func TestPruneReachesTheDisk(t *testing.T) {
+	f := newFixture(t)
+	opened := f.createSession(t)
+	if _, err := opened.AppendSurface(session.EventToolResult, map[string]any{
+		"turn": 1, "step": 1,
+		"message": map[string]any{
+			"id": session.NewID(), "role": "tool", "toolCallId": "c1",
+			"content": []any{map[string]any{"type": "text", "text": strings.Repeat("Z", 40000)}},
+		},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	f.invoke(t, "session/compact", map[string]any{
+		"request": map[string]any{"sessionId": opened.ID()},
+	}).mustSucceed(t)
+
+	reader, err := session.NewStore(filepath.Join(f.root, "sessions"))
+	if err != nil {
+		t.Fatalf("second store: %v", err)
+	}
+	defer reader.Close()
+	reopened, err := reader.OpenRead(opened.ID())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	var prunes int
+	for _, event := range reopened.Events() {
+		if event.Type == session.EventCompactionPrune {
+			prunes++
+		}
+	}
+	if prunes == 0 {
+		t.Fatal("a second process would not see the prune")
+	}
+}
+
+// TestCompactSentAsPromptTextRunsTheCommand closes the second route a slash
+// command takes: the composer sometimes sends `/compact` as an ordinary prompt,
+// and treating it as chat text would hand the model a line it cannot execute.
+func TestCompactSentAsPromptTextRunsTheCommand(t *testing.T) {
+	f := newFixture(t)
+	opened := f.createSession(t)
+	fillHistory(t, opened, 12)
+
+	f.invoke(t, "session/prompt", map[string]any{
+		"request": map[string]any{
+			"sessionId": opened.ID(),
+			"content":   []map[string]any{{"type": "text", "text": "/compact"}},
+		},
+	}).mustSucceed(t)
+
+	var sawRun, sawSummary, sawPromptMessage bool
+	for _, event := range opened.Events() {
+		switch event.Type {
+		case session.EventCommandRun:
+			sawRun = true
+		case session.EventCompactionSummary:
+			sawSummary = true
+		case session.EventUserMessage:
+			// The line must not also be recorded as something the person said.
+			var payload struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			}
+			if json.Unmarshal(event.Data, &payload) == nil && len(payload.Content) > 0 &&
+				strings.TrimSpace(payload.Content[0].Text) == "/compact" {
+				sawPromptMessage = true
+			}
+		}
+	}
+	if !sawRun {
+		t.Fatal("/compact was not recorded as a command")
+	}
+	if !sawSummary {
+		t.Fatal("/compact did not compact")
+	}
+	if sawPromptMessage {
+		t.Fatal("the command line was also recorded as a chat message")
+	}
+}
+
+// TestOrdinarySlashMessagesStillReachTheModel keeps the interception narrow: a
+// message that merely starts with a slash is not a command.
+func TestOrdinarySlashMessagesStillReachTheModel(t *testing.T) {
+	f := newFixture(t)
+	opened := f.createSession(t)
+	f.invoke(t, "session/prompt", map[string]any{
+		"request": map[string]any{
+			"sessionId": opened.ID(),
+			"content":   []map[string]any{{"type": "text", "text": "/etc/hosts is broken, please look"}},
+		},
+	}).mustSucceed(t)
+	for _, event := range opened.Events() {
+		if event.Type == session.EventCommandRun {
+			t.Fatal("an ordinary message was treated as a command")
+		}
+	}
+}

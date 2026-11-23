@@ -482,7 +482,7 @@ func compactionWindow(catalog *modelconfig.Catalog) int64 {
 // The roots are the ones DSH searches: the project's own directories, then the
 // user's, so a repository can pin instructions without renaming them.
 func loadSkillsFor(opts Options, logf func(format string, args ...any)) []agent.SkillDefinition {
-	roots := agent.SkillRoots(opts.ToolRoot, opts.DataDir, nil)
+	roots := agent.SkillRoots(opts.ToolRoot, opts.DataDir, agent.AgentsHome(), nil)
 	skills, err := agent.LoadSkills(roots)
 	if err != nil && logf != nil {
 		logf("skills: %v", err)

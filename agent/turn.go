@@ -39,14 +39,26 @@ func (r *Runner) driveTurn(ctx context.Context, req PromptRequest, sess *session
 		started = r.startContinuationTurn
 	}
 	// Pressure is checked before the turn's request is assembled: a session that
-	// no longer fits its window must be compacted before the model is sent a
-	// history the provider will refuse.
+	// no longer fits its window must be shrunk before the model is sent a history
+	// the provider will refuse.
+	//
+	// The model-free prune runs first and the result is re-measured, exactly as
+	// DSH orders it: cutting a few oversized tool results usually closes the
+	// excess on its own, and summarizing history to reclaim text that could
+	// simply be trimmed would spend a model call to lose more than it saved.
 	if budget, pressure := r.shouldCompact(sess); pressure {
-		turnNumber := int64(turn)
-		if compacted, err := r.compactSurface(ctx, sess, budget, &turnNumber); err != nil {
-			r.logf("session %s: compaction: %v", sess.ID(), err)
-		} else if compacted {
-			r.logf("session %s: compacted under pressure", sess.ID())
+		if pruned, err := r.PruneSession(sess); err != nil {
+			r.logf("session %s: prune: %v", sess.ID(), err)
+		} else if pruned.Pruned > 0 {
+			r.logf("session %s: pruned %d tool results (-%d chars)", sess.ID(), pruned.Pruned, pruned.CharsRemoved)
+		}
+		if _, stillPressed := r.shouldCompact(sess); stillPressed {
+			turnNumber := int64(turn)
+			if compacted, err := r.compactSurface(ctx, sess, budget, &turnNumber); err != nil {
+				r.logf("session %s: compaction: %v", sess.ID(), err)
+			} else if compacted {
+				r.logf("session %s: compacted under pressure", sess.ID())
+			}
 		}
 	}
 	if err := started(sess, req, turn, TextContent(req.Content)); err != nil {

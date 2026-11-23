@@ -179,6 +179,14 @@ func (s *Service) prompt(args json.RawMessage) (any, error) {
 	if len(parts) == 0 {
 		return nil, fail(CodeBadRequest, "prompt needs at least one text part")
 	}
+	// A slash command sent as prose is still a command. The composer sends
+	// `/compact` both ways depending on the surface, and treating the prose form as
+	// a chat message would hand the model a line it cannot execute.
+	if len(parts) == 1 && strings.HasPrefix(strings.TrimSpace(parts[0].Text), "/") {
+		if handled, outcome, err := s.runPromptCommand(request.SessionID, parts[0].Text); handled {
+			return outcome, err
+		}
+	}
 	if s.cfg.Runner == nil {
 		return nil, fail(CodeUnimplemented, "prompting is not configured")
 	}

@@ -126,3 +126,32 @@ func parseCommandLine(line string) (name, rawInput string) {
 	parsed, rest, _ := strings.Cut(trimmed, " ")
 	return strings.TrimSpace(parsed), strings.TrimSpace(rest)
 }
+
+// runPromptCommand executes a slash command that arrived as prompt text.
+//
+// It reports handled=false for anything that is not a command this backend knows,
+// so ordinary messages beginning with a slash still reach the model instead of
+// being swallowed.
+func (s *Service) runPromptCommand(sessionID, text string) (bool, any, error) {
+	name, rawInput := parseCommandLine(text)
+	known := false
+	for i := range supportedCommands {
+		if supportedCommands[i].Name == name {
+			known = true
+			break
+		}
+	}
+	if !known {
+		return false, nil, nil
+	}
+	body, err := json.Marshal(map[string]any{"sessionId": sessionID, "line": text})
+	if err != nil {
+		return true, nil, fail(CodeInternal, err.Error())
+	}
+	value, err := s.commandsExecute(body)
+	if err != nil {
+		return true, nil, err
+	}
+	_ = rawInput
+	return true, value, nil
+}

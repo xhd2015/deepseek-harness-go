@@ -147,6 +147,11 @@ func (r *Runner) CompactNow(sessionID string) (bool, error) {
 	if r.Busy(sessionID) {
 		return false, fmt.Errorf("compaction is unavailable while a turn is running; wait for it to finish")
 	}
+	// The manual path prunes too, for the same reason the automatic one does: a
+	// user who asked for a smaller session gets the cheap win first.
+	if _, err := r.PruneSession(opened); err != nil {
+		return false, err
+	}
 	return r.compactSurface(context.Background(), opened, nil, nil)
 }
 

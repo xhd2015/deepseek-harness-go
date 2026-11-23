@@ -101,6 +101,43 @@ func TestSkillRefusesUserOnlySkills(t *testing.T) {
 	}
 }
 
+// TestUserAgentsSkillsAreSearched is the gap the verification agent found: the
+// person's own skills live in ~/.agents/skills, and a backend that never looks
+// there answers "unknown skill" for names that plainly exist.
+func TestUserAgentsSkillsAreSearched(t *testing.T) {
+	agentsHome := t.TempDir()
+	writeSkill(t, filepath.Join(agentsHome, "skills"), "brainstorm", "name: brainstorm\ndescription: Plan first.\n", "Ask before building.")
+
+	roots := SkillRoots(t.TempDir(), t.TempDir(), agentsHome, nil)
+	var sources []string
+	for _, root := range roots {
+		sources = append(sources, root.Source)
+	}
+	if !strings.Contains(strings.Join(sources, ","), "user-agents") {
+		t.Fatalf("sources = %v, want the user agents root among them", sources)
+	}
+	skills, err := LoadSkills(roots)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	skill, ok := FindSkill(skills, "brainstorm")
+	if !ok {
+		t.Fatalf("a user-level skill was not found; loaded %v", namesOf(skills))
+	}
+	if skill.Description != "Plan first." {
+		t.Fatalf("skill = %+v", skill)
+	}
+}
+
+// TestAgentsHomeHonoursTheEnvironment keeps the root overridable for a deployment
+// that keeps agents state elsewhere.
+func TestAgentsHomeHonoursTheEnvironment(t *testing.T) {
+	t.Setenv("DSH_AGENTS_HOME", "/opt/agents")
+	if got := AgentsHome(); got != "/opt/agents" {
+		t.Fatalf("AgentsHome = %q", got)
+	}
+}
+
 // TestProjectSkillWinsOverUserSkill pins the precedence the roots encode.
 func TestProjectSkillWinsOverUserSkill(t *testing.T) {
 	project := t.TempDir()

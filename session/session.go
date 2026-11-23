@@ -602,3 +602,16 @@ func (s *Session) Surface() []Event {
 	}
 	return surface
 }
+
+// AppendReplacing appends one surface event that replaces an existing range.
+//
+// This is how compaction and pruning rewrite history: the replacement is an
+// ordinary event with a `replace` op, so a reader rebuilds the conversation from
+// it and the replaced span is never sent again.
+func (s *Session) AppendReplacing(typ string, data []byte, span SeqRange) (Event, error) {
+	return s.append(Event{
+		Type:      typ,
+		Data:      data,
+		SurfaceOp: &SurfaceOp{Replace: true, StartSeq: span.Start, EndSeq: span.End},
+	})
+}

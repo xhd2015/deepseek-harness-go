@@ -47,11 +47,13 @@ const skillFileName = "SKILL.md"
 
 // SkillRoots resolves the directories to search, most specific first.
 //
-// The order is the contract: a project skill overrides a user skill of the same
-// name, so a repository can pin its own instructions without renaming them. Extra
-// roots come from the caller, and the harness home contributes the user's own.
-func SkillRoots(cwd, dshHome string, extra []string) []SkillRoot {
-	roots := make([]SkillRoot, 0, 6)
+// The order is the precedence contract, and it is DSH's: a project skill overrides
+// a custom root, which overrides the harness home, which overrides the user's
+// agents home. Getting this list short would silently hide skills rather than
+// fail — the model simply would not know a name exists — so all five sources are
+// searched.
+func SkillRoots(cwd, dshHome, agentsHome string, extra []string) []SkillRoot {
+	roots := make([]SkillRoot, 0, 7)
 	add := func(path, source string) {
 		if strings.TrimSpace(path) == "" {
 			return
@@ -73,7 +75,28 @@ func SkillRoots(cwd, dshHome string, extra []string) []SkillRoot {
 	if dshHome != "" {
 		add(filepath.Join(dshHome, "skills"), "user-dsh")
 	}
+	if agentsHome != "" {
+		// The user's own skills live here, next to the project's `.agents`:
+		// the same convention at the other level.
+		add(filepath.Join(agentsHome, "skills"), "user-agents")
+	}
 	return roots
+}
+
+// AgentsHome reports the user-level agents home: $DSH_AGENTS_HOME, else ~/.agents.
+//
+// It is a separate root from the harness home on purpose: the harness home holds
+// one installation's state, while this one holds the person's own skills, shared
+// by every checkout they work in.
+func AgentsHome() string {
+	if home := strings.TrimSpace(os.Getenv("DSH_AGENTS_HOME")); home != "" {
+		return home
+	}
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(userHome, ".agents")
 }
 
 // findProjectRoot walks up from cwd looking for a repository marker.

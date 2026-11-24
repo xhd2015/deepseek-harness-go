@@ -264,7 +264,15 @@ func (r *Runner) CompactNow(sessionID string) (bool, error) {
 	if _, err := r.PruneSession(opened); err != nil {
 		return false, err
 	}
-	return r.compactSurface(context.Background(), opened, nil, nil)
+	// The manual path resolves the same budget the automatic one does. Passing nil
+	// here is what let `/compact` report success without freeing anything usable:
+	// with no budget there is no window to measure the result against, and no
+	// retained-token cap to choose the tail by.
+	budget := r.compactionBudget(opened)
+	if budget == nil {
+		return false, fmt.Errorf("compaction needs a known context window; this session's model declares none")
+	}
+	return r.compactSurface(context.Background(), opened, budget, nil)
 }
 
 // compactableRange picks the span a compaction replaces.
@@ -388,4 +396,19 @@ func estimateTokens(text string) int64 {
 		return 0
 	}
 	return int64(len(text)/4) + 1
+}
+
+// SetCompactionWindow installs the window a runner compacts against when its
+// sessions select no model of their own.
+//
+// Exported for embedders and tests that provide the capacity out of band instead of
+// through a catalog: without a window there is no pressure to measure, so automatic
+// compaction is off and a manual `/compact` is refused rather than run blind.
+func (r *Runner) SetCompactionWindow(tokens int64) {
+	r.mu.Lock()
+	if r.cfg.Compaction == nil {
+		r.cfg.Compaction = &CompactionConfig{}
+	}
+	r.cfg.Compaction.ContextWindowTokens = tokens
+	r.mu.Unlock()
 }

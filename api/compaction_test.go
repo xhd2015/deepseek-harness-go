@@ -17,10 +17,21 @@ import (
 // fillHistory appends n user/assistant pairs so there is something to compact.
 func fillHistory(t *testing.T, opened *session.Session, n int) {
 	t.Helper()
+	fillHistorySized(t, opened, n, "question", "answer")
+}
+
+// fillHistorySized writes n exchanges of a given size.
+//
+// The size matters now that the retained tail is measured in tokens: a handful of
+// tiny messages fits inside any retain budget, so nothing is replaceable and a
+// compaction is rightly a no-op. A test that wants compaction has to exceed the
+// budget, which is what a real session under pressure looks like.
+func fillHistorySized(t *testing.T, opened *session.Session, n int, question, answer string) {
+	t.Helper()
 	for i := 0; i < n; i++ {
 		if _, err := opened.AppendSurface(session.EventUserMessage, map[string]any{
 			"role": "user", "id": session.NewID(),
-			"content": []any{map[string]any{"type": "text", "text": "question"}},
+			"content": []any{map[string]any{"type": "text", "text": question}},
 		}); err != nil {
 			t.Fatalf("append user: %v", err)
 		}
@@ -28,7 +39,7 @@ func fillHistory(t *testing.T, opened *session.Session, n int) {
 			"turn": 1, "step": 1,
 			"message": map[string]any{
 				"id": session.NewID(), "role": "assistant",
-				"content": []any{map[string]any{"type": "text", "text": "answer"}},
+				"content": []any{map[string]any{"type": "text", "text": answer}},
 			},
 		}); err != nil {
 			t.Fatalf("append assistant: %v", err)
@@ -40,8 +51,14 @@ func fillHistory(t *testing.T, opened *session.Session, n int) {
 // idle session can be compacted on request and produces the four events.
 func TestManualCompactWritesTheSameEventsAsAutomatic(t *testing.T) {
 	f := newFixture(t)
+	// A manual compaction measures its result against the window, so the fixture
+	// has to declare one; a runner without a window refuses rather than run blind.
+	// A window has to exist and be smaller than the history: a manual compaction
+	// measures its result against it, and a retained tail that already fits means
+	// the compaction is correctly a no-op.
+	f.runner.SetCompactionWindow(8000)
 	opened := f.createSession(t)
-	fillHistory(t, opened, 12)
+	fillPressured(t, opened)
 
 	f.invoke(t, "session/compact", map[string]any{
 		"request": map[string]any{"sessionId": opened.ID()},
@@ -62,8 +79,9 @@ func TestManualCompactWritesTheSameEventsAsAutomatic(t *testing.T) {
 // TestCompactReportsWhatHappened lets the page draw the state it just created.
 func TestCompactReportsWhatHappened(t *testing.T) {
 	f := newFixture(t)
+	f.runner.SetCompactionWindow(8000)
 	opened := f.createSession(t)
-	fillHistory(t, opened, 12)
+	fillPressured(t, opened)
 	f.invoke(t, "session/compact", map[string]any{
 		"request": map[string]any{"sessionId": opened.ID()},
 	}).mustSucceed(t)
@@ -127,8 +145,9 @@ func TestCompactRefusesWhileRunning(t *testing.T) {
 // the page sends produces the same events, plus its own lifecycle.
 func TestCompactCommandRunsTheManualPath(t *testing.T) {
 	f := newFixture(t)
+	f.runner.SetCompactionWindow(8000)
 	opened := f.createSession(t)
-	fillHistory(t, opened, 12)
+	fillPressured(t, opened)
 
 	value := f.invoke(t, "commands/execute", map[string]any{
 		"sessionId": opened.ID(),
@@ -256,6 +275,8 @@ func newBlockingFixture(t *testing.T, release chan struct{}) *fixture {
 // log is compressed, so reading the file bytes would prove nothing.
 func TestPruneReachesTheDisk(t *testing.T) {
 	f := newFixture(t)
+	// The manual path measures its result against a window, so one has to exist.
+	f.runner.SetCompactionWindow(8000)
 	opened := f.createSession(t)
 	if _, err := opened.AppendSurface(session.EventToolResult, map[string]any{
 		"turn": 1, "step": 1,
@@ -295,8 +316,9 @@ func TestPruneReachesTheDisk(t *testing.T) {
 // and treating it as chat text would hand the model a line it cannot execute.
 func TestCompactSentAsPromptTextRunsTheCommand(t *testing.T) {
 	f := newFixture(t)
+	f.runner.SetCompactionWindow(8000)
 	opened := f.createSession(t)
-	fillHistory(t, opened, 12)
+	fillPressured(t, opened)
 
 	f.invoke(t, "session/prompt", map[string]any{
 		"request": map[string]any{
@@ -352,4 +374,11 @@ func TestOrdinarySlashMessagesStillReachTheModel(t *testing.T) {
 			t.Fatal("an ordinary message was treated as a command")
 		}
 	}
+}
+
+// fillPressured writes a history that exceeds the fixture model's window, so a
+// compaction has something to replace.
+func fillPressured(t *testing.T, opened *session.Session) {
+	t.Helper()
+	fillHistorySized(t, opened, 16, strings.Repeat("q", 40000), strings.Repeat("a", 40000))
 }

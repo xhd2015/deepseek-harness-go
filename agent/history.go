@@ -44,8 +44,39 @@ type transcriptMessage struct {
 func (r *Runner) history(sess *session.Session) []llm.Message {
 	messages := []llm.Message{{Role: "system", Content: r.systemPromptFor(sess)}}
 	sources := []int64{-1}
-	for _, event := range sess.Events() {
+	// The surface, not the raw log. Compaction replaces a span by recording a
+	// summary and the range it stands for; reading every event would hand the model
+	// the history the compaction exists to remove, which is why a session could
+	// "compact successfully" and still exceed the window on the next request.
+	for _, event := range sess.Surface() {
 		switch event.Type {
+		case session.EventCompactionSummary:
+			// The replacement text stands in for the span it shadowed. Without this
+			// the model would see a gap where its own earlier work used to be.
+			var stored struct {
+				Summary []struct {
+					Text string `json:"text"`
+				} `json:"summary"`
+			}
+			if err := json.Unmarshal(event.Data, &stored); err != nil {
+				continue
+			}
+			var text strings.Builder
+			for _, block := range stored.Summary {
+				if block.Text == "" {
+					continue
+				}
+				text.WriteString(block.Text)
+				text.WriteString("\n")
+			}
+			if strings.TrimSpace(text.String()) == "" {
+				continue
+			}
+			messages = append(messages, llm.Message{
+				Role:    "system",
+				Content: "Earlier conversation, compacted:\n\n" + strings.TrimSpace(text.String()),
+			})
+			sources = append(sources, event.Seq)
 		case session.EventUserMessage:
 			var stored transcriptMessage
 			if err := json.Unmarshal(event.Data, &stored); err != nil {

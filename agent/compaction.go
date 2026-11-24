@@ -220,10 +220,11 @@ func (r *Runner) compactionResultCheck(opened *session.Session, budget *session.
 	if budget == nil || budget.ContextWindowTokens <= 0 {
 		return nil
 	}
-	if remaining := r.requestFrameTokens(opened); remaining > budget.ContextWindowTokens {
+	surface, system, tools := r.requestFrameBreakdown(opened)
+	if remaining := surface + system + tools; remaining > budget.ContextWindowTokens {
 		return fmt.Errorf(
-			"compaction/ineffective: needs %d tokens, window %d (%s)",
-			remaining, budget.ContextWindowTokens, budget.WindowSource)
+			"compaction/ineffective: needs %d tokens (surface %d + system %d + tools %d), window %d (%s)",
+			remaining, surface, system, tools, budget.ContextWindowTokens, budget.WindowSource)
 	}
 	return nil
 }
@@ -245,16 +246,23 @@ func surfaceTokens(opened *session.Session) int64 {
 // the wire, and on a loaded preset they are not a rounding error. The window belongs
 // to the whole frame, so the check has to compare the whole frame.
 func (r *Runner) requestFrameTokens(opened *session.Session) int64 {
-	total := surfaceTokens(opened)
+	surface, system, tools := r.requestFrameBreakdown(opened)
+	return surface + system + tools
+}
+
+// requestFrameBreakdown is the three parts, for a diagnostic that has to say which
+// one is responsible.
+func (r *Runner) requestFrameBreakdown(opened *session.Session) (surface, system, tools int64) {
+	surface = surfaceTokens(opened)
 	if prompt := r.systemPromptFor(opened); prompt != "" {
-		total += estimateTokens(prompt)
+		system = estimateTokens(prompt)
 	}
 	if r.tools != nil {
 		if encoded, err := json.Marshal(r.tools.toolsFor(presetIDOf(opened))); err == nil {
-			total += estimateTokens(string(encoded))
+			tools = estimateTokens(string(encoded))
 		}
 	}
-	return total
+	return surface, system, tools
 }
 
 // CompactNow answers the manual `/compact` command.

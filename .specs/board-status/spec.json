@@ -46,7 +46,7 @@
   },
   "review": {
     "status": "pending",
-    "note": "新增子规格，7 条要求保持不变。两次实现尝试均已回退，原因与实测定位记录如下：第一次给扫描加总预算，冷缓存下会把每一行都判成未知，且被放弃的折叠仍在跑，第二次实测 95s；第二次改成非阻塞探测（未 warm 就报 pending 并由后台折叠），首屏仍 189s，并且收敛成「一直返回全 pending 快照」，97 行永不结算。加阶段计时后真正的耗时分布是：readOrchestrator ~30s、探测 0.04s、applyDSHSessionTitles ~76s、observeTouchMain ~116s——即开销不在探测，而在这两步仍在请求内同步折叠日志与探测 git。正确的下一步是把这两步移出请求路径（后台完成后由下一轮带出），而不是继续调整探测的等待策略；且需要在非高负载机器上验证。本机当时 load 130–200，任何绝对耗时都不可信。",
+    "note": "七条要求全部达成并实测通过，实现分三轮完成，前两轮尝试已回退，第三轮换方向后成立。\n达成证据：冷启动首屏 0.016s、129 行齐全；超预算行显示 unknown + largeLog，且 largeLog 只标真的超过 32MB 的日志（先判 not_found 再判大小）；unknown 约 45 秒内收敛到 0，不缓存成永久答案；那个 204MB 会话最终为 activity=idle / outcome=completed，折叠记录 next==size（100%）。\n三轮的关键发现：(1) 开销不在探测（0.04s）而在 applyDSHSessionTitles 与 observeTouchMain 两个同步折叠点，标题改读日志尾部后归零；(2) 首屏不再付冷扫描的钱，靠「从 store 组装全部行 + 占位 activity」加启动期预热；(3) agent-pro 的 decodeJSONLWindow 在事件预算下推进游标却丢弃事件，导致 seq 空洞与无限重启——这是 204MB 会话永不收敛的真正原因。\n【待办·未完成】eluc 的 go.mod 仍 pin agent-pro v0.0.251，修复在 v0.0.252（commit bd1bdd1f，仅本地 tag，远程没有）。现网二进制正确是因为构建时用了本地 replace，而 pre-commit 钩子禁止提交 replace。已实证：干净检出重建会退回旧行为——同一折叠测试两次 RESET（75590→1996、74136→1149）、60 轮不收敛。补法：推 v0.0.252 到 agent-pro remote，再把 eluc bump 到它。推 tag 属发布动作，需用户点头。",
     "by": "agent"
   }
 }

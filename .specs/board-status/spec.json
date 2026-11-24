@@ -46,7 +46,7 @@
   },
   "review": {
     "status": "pending",
-    "note": "七条要求全部达成并实测通过，实现分三轮完成，前两轮尝试已回退，第三轮换方向后成立。\n达成证据：冷启动首屏 0.016s、129 行齐全；超预算行显示 unknown + largeLog，且 largeLog 只标真的超过 32MB 的日志（先判 not_found 再判大小）；unknown 约 45 秒内收敛到 0，不缓存成永久答案；那个 204MB 会话最终为 activity=idle / outcome=completed，折叠记录 next==size（100%）。\n三轮的关键发现：(1) 开销不在探测（0.04s）而在 applyDSHSessionTitles 与 observeTouchMain 两个同步折叠点，标题改读日志尾部后归零；(2) 首屏不再付冷扫描的钱，靠「从 store 组装全部行 + 占位 activity」加启动期预热；(3) agent-pro 的 decodeJSONLWindow 在事件预算下推进游标却丢弃事件，导致 seq 空洞与无限重启——这是 204MB 会话永不收敛的真正原因。\n【待办·未完成】eluc 的 go.mod 仍 pin agent-pro v0.0.251，修复在 v0.0.252（commit bd1bdd1f，仅本地 tag，远程没有）。现网二进制正确是因为构建时用了本地 replace，而 pre-commit 钩子禁止提交 replace。已实证：干净检出重建会退回旧行为——同一折叠测试两次 RESET（75590→1996、74136→1149）、60 轮不收敛。补法：推 v0.0.252 到 agent-pro remote，再把 eluc bump 到它。推 tag 属发布动作，需用户点头。",
+    "note": "七条要求全部达成并实测通过，实现分三轮完成，前两轮尝试已回退，第三轮换方向后成立。\n达成证据：冷启动首屏 0.016s、129 行齐全；超预算行显示 unknown + largeLog，且 largeLog 只标真的超过 32MB 的日志（先判 not_found 再判大小）；unknown 约 45 秒内收敛到 0，不缓存成永久答案；那个 204MB 会话最终为 activity=idle / outcome=completed，折叠记录 next==size（100%）。\n三轮的关键发现：(1) 开销不在探测（0.04s）而在 applyDSHSessionTitles 与 observeTouchMain 两个同步折叠点，标题改读日志尾部后归零；(2) 首屏不再付冷扫描的钱，靠「从 store 组装全部行 + 占位 activity」加启动期预热；(3) agent-pro 的 decodeJSONLWindow 在事件预算下推进游标却丢弃事件，导致 seq 空洞与无限重启——这是 204MB 会话永不收敛的真正原因。\n【已发布】agent-pro v0.0.252（merge-back 落地提交 915ffe1c，远程 tag 与 master 一致）已推送；eluc bump 到 v0.0.252（提交 69956d97），go mod tidy 已跑，无 replace。可复现性已实证：干净检出（无 replace）折叠那个 204MB 日志 26 轮收敛、零 RESET、记录落盘；同一测试对 v0.0.251 是两次 RESET 且 60 轮不收敛。",
     "by": "agent"
   }
 }

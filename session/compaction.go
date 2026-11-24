@@ -33,6 +33,11 @@ type CompactionBudget struct {
 	ThresholdTokens int64 `json:"thresholdTokens"`
 	// RetainTokens is what the replacement keeps from the recent end.
 	RetainTokens int64 `json:"retainTokens"`
+	// WindowSource names where ContextWindowTokens came from. A window assumed
+	// from the deployment default and one read off the session's own model are
+	// different claims, and recording a compaction against the wrong one is what
+	// produced a "successful" compaction the next prompt still could not fit.
+	WindowSource string `json:"windowSource,omitempty"`
 }
 
 // SeqRange is a span of surface positions, inclusive.

@@ -223,8 +223,16 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		DSHHome:         opts.DataDir,
 		ModelsPath:      opts.Models,
 		Store:           store,
-		Compaction:      &agent.CompactionConfig{ContextWindowTokens: compactionWindow(catalog)},
-		Skills:          loadSkillsFor(opts, logf),
+		// The window here is only the fallback for a session that never selected a
+		// model: the runner re-resolves it per session, because a session routed to
+		// a smaller model must be compacted against that model's capacity.
+		//
+		// Summarize is model-written when the routed model can answer, and falls
+		// back to a model-free notice otherwise. Compaction has to work either way:
+		// refusing to compact because a summary call failed would leave a session
+		// over its window and unable to run at all.
+		Compaction: &agent.CompactionConfig{ContextWindowTokens: compactionWindow(catalog)},
+		Skills:     loadSkillsFor(opts, logf),
 		// The catalog is per project, so it is re-resolved for a session whose cwd
 		// differs from the boot directory. Boot-time resolution alone would give a
 		// session the skills of whatever directory the server happened to start in.
@@ -236,6 +244,12 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		},
 		Logf: logf,
 	})
+	// The summarizer needs the runner it belongs to, so it is installed after
+	// construction and before the runner serves anything. Installing it here rather
+	// than inside the literal is what lets a compaction write a real summary instead
+	// of the 40-character placeholder that made `/compact` look successful while the
+	// next prompt still did not fit.
+	runner.SetSummarizer(runner.SummarizeSpan)
 	// The page decides approvals; the runner only records and waits. Without this
 	// hook an escalation would be recorded and then fail closed on timeout, which
 	// looks to the user like a hang rather than a question.

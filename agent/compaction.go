@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -141,12 +142,7 @@ func (r *Runner) shouldCompact(opened *session.Session) (*session.CompactionBudg
 	if budget == nil {
 		return nil, false
 	}
-	surface := opened.Surface()
-	measured := int64(0)
-	for _, node := range surface {
-		measured += estimateTokens(string(node.Data))
-	}
-	return budget, measured >= budget.ThresholdTokens
+	return budget, r.requestFrameTokens(opened) >= budget.ThresholdTokens
 }
 
 // compactSurface selects the span to replace and writes the compaction.
@@ -161,7 +157,7 @@ func (r *Runner) compactSurface(ctx context.Context, opened *session.Session, bu
 		// Nothing worth replacing — but "nothing to replace" and "still too big" can
 		// both be true, and that combination is exactly a compaction that reports
 		// success while the next prompt is refused. The check runs either way.
-		return false, compactionResultCheck(opened, budget)
+		return false, r.compactionResultCheck(opened, budget)
 	}
 	summary := ""
 	if r.cfg.Compaction != nil && r.cfg.Compaction.Summarize != nil {
@@ -211,7 +207,7 @@ func (r *Runner) compactSurface(ctx context.Context, opened *session.Session, bu
 	// this check exists for: `/compact` reported success while the next prompt was
 	// still refused for length. The two numbers go in the error so the claim can be
 	// checked instead of believed.
-	return true, compactionResultCheck(opened, budget)
+	return true, r.compactionResultCheck(opened, budget)
 }
 
 // compactionResultCheck reports the session as unusable when the surface still
@@ -220,11 +216,11 @@ func (r *Runner) compactSurface(ctx context.Context, opened *session.Session, bu
 // The measure is the same fixed estimator, over the same surface, that the next
 // request is built from: checking with a different number would let a compaction
 // pass its own test and fail the request it was meant to enable.
-func compactionResultCheck(opened *session.Session, budget *session.CompactionBudget) error {
+func (r *Runner) compactionResultCheck(opened *session.Session, budget *session.CompactionBudget) error {
 	if budget == nil || budget.ContextWindowTokens <= 0 {
 		return nil
 	}
-	if remaining := surfaceTokens(opened); remaining > budget.ContextWindowTokens {
+	if remaining := r.requestFrameTokens(opened); remaining > budget.ContextWindowTokens {
 		return fmt.Errorf(
 			"compaction/ineffective: needs %d tokens, window %d (%s)",
 			remaining, budget.ContextWindowTokens, budget.WindowSource)
@@ -232,14 +228,33 @@ func compactionResultCheck(opened *session.Session, budget *session.CompactionBu
 	return nil
 }
 
-// surfaceTokens is the size of what the next request would send, by the same
-// fixed estimator shouldCompact uses.
+// surfaceTokens is the size of the conversation part of the next request.
 func surfaceTokens(opened *session.Session) int64 {
 	measured := int64(0)
 	for _, node := range opened.Surface() {
 		measured += estimateTokens(string(node.Data))
 	}
 	return measured
+}
+
+// requestFrameTokens is what the next request actually costs: the conversation
+// plus the system prompt and the tool schemas that travel with every call.
+//
+// Measuring only the conversation is how a compaction passes its own check and the
+// request still fails: the system prompt and twenty tool schemas are real tokens on
+// the wire, and on a loaded preset they are not a rounding error. The window belongs
+// to the whole frame, so the check has to compare the whole frame.
+func (r *Runner) requestFrameTokens(opened *session.Session) int64 {
+	total := surfaceTokens(opened)
+	if prompt := r.systemPromptFor(opened); prompt != "" {
+		total += estimateTokens(prompt)
+	}
+	if r.tools != nil {
+		if encoded, err := json.Marshal(r.tools.toolsFor(presetIDOf(opened))); err == nil {
+			total += estimateTokens(string(encoded))
+		}
+	}
+	return total
 }
 
 // CompactNow answers the manual `/compact` command.

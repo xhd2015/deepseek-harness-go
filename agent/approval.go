@@ -36,6 +36,15 @@ type ApprovalRequest struct {
 	ToolName string `json:"toolName"`
 	CallID   string `json:"callId,omitempty"`
 	Reason   string `json:"reason,omitempty"`
+	// The escalation itself, in structured form.
+	//
+	// Reason already says it in a sentence, but a sentence is for a reader, not
+	// for a page: a consumer that wants to show "workspace-write -> full access"
+	// and the command would have to parse prose that is free to change. These
+	// three are the same facts without the parsing.
+	RequestedSandbox string `json:"requestedSandbox,omitempty"`
+	EffectiveSandbox string `json:"effectiveSandbox,omitempty"`
+	Command          string `json:"command,omitempty"`
 }
 
 // approvalGate carries pending approvals between the runner and the page.
@@ -112,11 +121,15 @@ func (r *Runner) requestApproval(sess *session.Session, requested, effective str
 		toolName = "bash"
 	}
 	reason := approvalReason(command, requested, effective)
-	return r.askApproval(sess, toolName, inv.CallID, reason)
+	return r.askApproval(sess, toolName, inv.CallID, reason, escalation{
+		Requested: requested,
+		Effective: effective,
+		Command:   command,
+	})
 }
 
 // askApproval writes the audit pair around one wait.
-func (r *Runner) askApproval(sess *session.Session, toolName, callID, reason string) ApprovalOutcome {
+func (r *Runner) askApproval(sess *session.Session, toolName, callID, reason string, esc escalation) ApprovalOutcome {
 	policy := e_policyOf(r, sess)
 	if policy.Approval == session.ApprovalNever {
 		// No prompt is shown under `never`; the log states the refusal without
@@ -124,12 +137,22 @@ func (r *Runner) askApproval(sess *session.Session, toolName, callID, reason str
 		return ApprovalRejected
 	}
 	id := "approval-" + session.NewID()
-	if _, err := sess.Append(session.EventApprovalAsked, map[string]any{
+	asked := map[string]any{
 		"id":       id,
 		"toolName": toolName,
 		"callId":   callID,
 		"reason":   reason,
-	}); err != nil {
+	}
+	if esc.Requested != "" {
+		asked["requestedSandbox"] = esc.Requested
+	}
+	if esc.Effective != "" {
+		asked["effectiveSandbox"] = esc.Effective
+	}
+	if esc.Command != "" {
+		asked["command"] = esc.Command
+	}
+	if _, err := sess.Append(session.EventApprovalAsked, asked); err != nil {
 		// Without the question the pair cannot be honest; fail closed. The failure
 		// is logged because the alternative is a silent `unavailable` that looks
 		// identical to "nobody was listening" from the outside.
@@ -138,10 +161,12 @@ func (r *Runner) askApproval(sess *session.Session, toolName, callID, reason str
 	}
 	answer := r.approvals.ask(ApprovalRequest{
 		ID: id, Session: sess.ID(), ToolName: toolName, CallID: callID, Reason: reason,
+		RequestedSandbox: esc.Requested, EffectiveSandbox: esc.Effective, Command: esc.Command,
 	})
 	outcome := ApprovalUnavailable
 	request := ApprovalRequest{
 		ID: id, Session: sess.ID(), ToolName: toolName, CallID: callID, Reason: reason,
+		RequestedSandbox: esc.Requested, EffectiveSandbox: esc.Effective, Command: esc.Command,
 	}
 	if r.answerer != nil {
 		outcome = r.answerer(request)
@@ -197,6 +222,13 @@ func e_policyOf(r *Runner, sess *session.Session) session.PermissionState {
 // neverSentenceFor exposes the policy statement the model is shown.
 func neverSentenceFor() string { return neverSentence }
 
+// escalation is the structured half of a widening request.
+type escalation struct {
+	Requested string
+	Effective string
+	Command   string
+}
+
 // approvalReason renders the escalation a caller is asking for.
 func approvalReason(command, requested, effective string) string {
 	return fmt.Sprintf("Retry under %s (currently %s): %s", requested, effective, command)
@@ -212,7 +244,15 @@ func (r *Runner) SetApprovalNotifier(notify func(ApprovalRequest)) {
 
 // RequestApprovalForTest asks one approval by hand, for tests and diagnostics.
 func (r *Runner) RequestApprovalForTest(sess *session.Session, toolName, callID, reason string) ApprovalOutcome {
-	return r.askApproval(sess, toolName, callID, reason)
+	return r.askApproval(sess, toolName, callID, reason, escalation{})
+}
+
+// RequestEscalationForTest asks one widening approval with its structured facts,
+// so a test can assert the frame a page receives.
+func (r *Runner) RequestEscalationForTest(sess *session.Session, toolName, callID, requested, effective, command string) ApprovalOutcome {
+	return r.askApproval(sess, toolName, callID,
+		approvalReason(command, requested, effective),
+		escalation{Requested: requested, Effective: effective, Command: command})
 }
 
 // SetApprovalAnswerer installs an in-process decision, used by tests and by a

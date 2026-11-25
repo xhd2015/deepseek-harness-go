@@ -76,6 +76,17 @@ func (s *Service) permissionPresetsSet(args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A turn in flight must not have its policy swapped under it.
+	//
+	// The policy is folded per tool call (see ToolExecutor.policyFor), so a write
+	// that lands mid-turn changes the gate for the steps that have not run yet:
+	// two calls in one turn would be checked against different rules, and the
+	// transcript would show one mode while half the turn ran under another. The
+	// page disables its control while a turn runs, but a page is not the only
+	// caller — refusing here is what makes the rule true for every caller.
+	if s.cfg.Runner != nil && s.cfg.Runner.Busy(opened.ID()) {
+		return nil, fail(CodeBusy, "cannot change permission while a turn is running")
+	}
 	if err := applyPreset(opened, preset); err != nil {
 		return nil, fail(CodeInternal, err.Error())
 	}
@@ -110,14 +121,27 @@ func applyPreset(opened *session.Session, preset session.PresetSpec) error {
 // The approval id, not the waterfall id, names the audit pair. `$events/result`
 // carries the waterfall id, so the mapping is kept explicitly.
 func (s *Service) PublishApproval(request agent.ApprovalRequest) {
-	eventID, err := s.publishWaterfall("approval/request", request.Session, map[string]any{
+	payload := map[string]any{
 		"toolName": request.ToolName,
 		"callId":   request.CallID,
 		"reason":   request.Reason,
 		// The approval id travels with the request as well, so a page that keeps the
 		// id it rendered can answer without depending on the frame correlation.
 		"id": request.ID,
-	})
+	}
+	// The escalation in structured form. Omitted when a caller has none, so an
+	// older producer's frame keeps its old shape and a consumer can tell the two
+	// apart instead of rendering a delta with empty halves.
+	if request.RequestedSandbox != "" {
+		payload["requestedSandbox"] = request.RequestedSandbox
+	}
+	if request.EffectiveSandbox != "" {
+		payload["effectiveSandbox"] = request.EffectiveSandbox
+	}
+	if request.Command != "" {
+		payload["command"] = request.Command
+	}
+	eventID, err := s.publishWaterfall("approval/request", request.Session, payload)
 	if err != nil {
 		s.logf("publish approval: %v", err)
 		return

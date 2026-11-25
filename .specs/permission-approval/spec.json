@@ -35,8 +35,8 @@
   },
   "backend": {
     "apis": [
-      "POST /api/session/permissionPresets/set",
-      "POST /api/session/permissionPresets/catalog"
+      "POST /api/permissionPresets/catalog",
+      "POST /api/permissionPresets/set"
     ],
     "constraints": [
       {

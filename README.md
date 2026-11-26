@@ -318,6 +318,26 @@ with `{"type":"client-request","rpcId","method","payload":{"args":{...}}}` and a
 must be `application/json`; `method` must match the path; the launch token is
 accepted as `Authorization: Bearer`. Streams stay on `/api/remote.mux`.
 
+One Host route is implemented here rather than left to the capture, because it
+is how the page shows a screenshot at all: **`GET`/`HEAD /api/file?path=…`**
+reads one absolute path and answers its bytes, `FS_NOT_FOUND` (`404`),
+`FS_NOT_REGULAR_FILE` (`403`), `FS_PERMISSION_DENIED` (`403`), `FS_TOO_LARGE`
+(`413`) or `FS_BAD_PATH` (`400`) when it cannot. The failure body *is* that code
+and carries no `Content-Length` of its own, so a client can always read it: a
+length taken from the `stat` would describe bytes that a denied or vanished file
+never produces, and Go drops a body shorter than its declared length. HEAD
+reaches the same verdict as the GET, denial included, so a probe cannot report
+an unreadable file as ready.
+Like the Harness, it redirects a request without the current
+`?v=` to the versioned URL (`private, no-store`), and the versioned answer is
+`immutable` for a year; `HEAD` reports the size without the body. Authentication
+matches the mux, and the byte bound defaults to the Harness image limit. The
+sandbox confines writes, not reads, so the route reaches any path the process
+can open — a session's screenshots routinely live outside its checkout. A GET
+under `/api/` that no route claims answers `501 ROUTE_NOT_IMPLEMENTED: <path>`
+instead of the setup page, so a missing route is never read as a broken
+deployment or a deleted file.
+
 Anything else returns a structured `unimplemented` error and ends the stream;
 the UI stays usable because those calls are optional for the chat page.
 

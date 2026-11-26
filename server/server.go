@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -70,6 +71,9 @@ type Config struct {
 	// PublishListenTo mirrors the record into a second directory, for clients
 	// that resolve discovery through DSH_HOME.
 	PublishListenTo string
+	// MaxFileBytes bounds one media response on FilePath. Zero uses
+	// DefaultMaxFileBytes, which matches the Harness image limit.
+	MaxFileBytes int64
 	// Logf receives diagnostics; nil discards them.
 	Logf func(format string, args ...any)
 }
@@ -195,6 +199,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	case r.URL.Path == MuxPath:
 		s.serveStreams(w, r)
+	case r.URL.Path == FilePath && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+		// The page's own media route. It is served here, not from the capture:
+		// a host that mounts this backend has no capture, and forwarding it to a
+		// running UI is what made a screenshot read "cannot reach the file
+		// server" on a backend that was perfectly healthy.
+		s.serveFile(w, r)
 	case s.proxy != nil:
 		s.proxy.ServeHTTP(w, r)
 	default:
@@ -284,23 +294,43 @@ func cookieValue(token string) string {
 }
 
 // serveAsset answers one captured response.
+//
+// A page asset that has no answer is a 404, but a GET under the API prefix that
+// has no answer is not a missing page: it is a Host route this backend does not
+// implement. Answering the setup page or a plain 404 there told the page "the
+// deployment is broken" or "the file was deleted" about a route that was simply
+// never mounted, so that case is named instead. A capture still wins: the
+// worker bundle and every other API asset the capture holds are served as before.
 func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.Frontend == nil {
+	if s.cfg.Frontend != nil {
+		if body, contentType, ok := s.lookupAsset(r); ok {
+			s.writeAsset(w, r, body, contentType)
+			return
+		}
+	}
+	if r.URL.Path == "/" {
 		s.serveSetup(w)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, APIPrefix) {
+		s.serveUnroutedAPI(w, r)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+// lookupAsset resolves one request against the capture, including the entry a
+// bare /index.html falls back to.
+func (s *Server) lookupAsset(r *http.Request) ([]byte, string, bool) {
 	body, contentType, ok := s.cfg.Frontend.Lookup(r.URL.RequestURI())
 	if !ok && r.URL.Path == "/index.html" {
 		body, contentType, ok = s.cfg.Frontend.Lookup("/")
 	}
-	if !ok {
-		if r.URL.Path == "/" {
-			s.serveSetup(w)
-			return
-		}
-		http.NotFound(w, r)
-		return
-	}
+	return body, contentType, ok
+}
+
+// writeAsset answers one captured body.
+func (s *Server) writeAsset(w http.ResponseWriter, r *http.Request, body []byte, contentType string) {
 	if contentType == "" {
 		contentType = http.DetectContentType(body)
 	}
@@ -312,6 +342,28 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request) {
 		header.Set("X-Content-Type-Options", "nosniff")
 	}
 	_, _ = w.Write(body)
+}
+
+// UnroutedAPICode is the header and body prefix that names a route this backend
+// does not implement. A client can tell it apart from a missing file (404) and
+// from a deployment that lacks the frontend (503).
+const UnroutedAPICode = "ROUTE_NOT_IMPLEMENTED"
+
+// serveUnroutedAPI answers a GET under the API prefix that no route claimed.
+//
+// The Harness page asks for several Host routes this backend does not have
+// (the export, present and plugin-detail reads). They are optional for the
+// chat page, so the answer has to be distinguishable: 501 says "this backend
+// does not implement that route", which is neither a server fault nor a
+// deleted file.
+func (s *Server) serveUnroutedAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNotImplemented)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = io.WriteString(w, UnroutedAPICode+": "+r.URL.Path+"\n")
 }
 
 // serveSetup explains how to stage the frontend when no capture is embedded.

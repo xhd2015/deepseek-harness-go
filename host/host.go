@@ -96,6 +96,9 @@ type Options struct {
 	// recorded cwd, and the directory validated at startup. It is not a read
 	// jail. Empty uses the process working directory.
 	ToolRoot string
+	// MaxFileBytes bounds one media response on /api/file. Zero uses the
+	// Harness image limit, which is also the attachment limit.
+	MaxFileBytes int64
 
 	Stdout io.Writer
 	Stderr io.Writer
@@ -304,6 +307,9 @@ func NewServer(opts Options) (*server.Server, func(), error) {
 		Frontend: opts.Frontend,
 		ProxyTo:  opts.ProxyTo,
 		Token:    opts.Token,
+		// Zero means the Harness image limit, so a host that never thinks about
+		// media still answers its own media route with the usual bound.
+		MaxFileBytes: opts.MaxFileBytes,
 		// The listen record is how external clients find this process.
 		ListenRecord:    opts.ListenRecord,
 		ListenRecordDir: opts.DataDir,
